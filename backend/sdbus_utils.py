@@ -179,9 +179,7 @@ class SdbusNm:
                         ap.rsn_flags or ap.wpa_flags or ap.flags
                     ),
                     "frequency": WifiChannels(ap.frequency)[0],
-                    "channel": WifiChannels(ap.frequency)[1],
                     "signal_level": ap.strength,
-                    "max_bitrate": ap.max_bitrate,
                     "BSSID": ap.hw_address,
                 }
                 for ap in all_aps

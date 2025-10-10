@@ -1,4 +1,5 @@
 from flask import Flask, jsonify, request, Response
+from flask_cors import CORS
 import json
 import threading
 import time
@@ -6,7 +7,7 @@ from sdbus_utils import SdbusNm  # твой класс
 from sdbus_block.networkmanager import enums
 
 app = Flask(__name__)
-
+CORS(app)  # разрешает все домены (только для dev!)
 # Callback для сообщений (можно кастомизировать под GUI)
 def popup_handler(msg, level=0):
     print(f"[POPUP-{level}] {msg}")
@@ -19,8 +20,7 @@ def make_json_response(data, status=200):
         status=status,
         mimetype="application/json"
     )
-
-
+    
 @app.route("/wifi/networks", methods=["GET"])
 def list_networks():
     nm = SdbusNm(popup_handler)
@@ -48,17 +48,26 @@ def connect_network():
     nm = SdbusNm(popup_handler)
     data = request.json
     ssid = data.get("ssid")
-    password = data.get("password", "")
+    password = data.get("password", "").strip()  # убираем пробелы
     eap_method = data.get("eap_method", None)
     identity = data.get("identity", "")
     phase2 = data.get("phase2", None)
 
-    result = nm.add_network(ssid, password, eap_method, identity, phase2)
-    if "error" in result:
-        return make_json_response(result, status=400)
+    # Проверяем, существует ли уже соединение с этой сетью
+    if not nm.is_known(ssid):
+        # Только если сеть НОВАЯ — добавляем её
+        result = nm.add_network(ssid, password, eap_method, identity, phase2)
+        if "error" in result:
+            return make_json_response(result, status=400)
+    else:
+        popup_handler(f"Сеть {ssid} уже известна, используем существующее соединение", level=1)
 
-    nm.connect(ssid)
-    return make_json_response({"status": "connecting", "ssid": ssid})
+    # Подключаемся (активируем соединение)
+    try:
+        nm.connect(ssid)
+        return make_json_response({"status": "connecting", "ssid": ssid})
+    except Exception as e:
+        return make_json_response({"error": str(e)}, status=500)
 
 
 @app.route("/wifi/disconnect", methods=["POST"])
@@ -87,10 +96,12 @@ def toggle_wifi():
 def rescan_networks():
     nm = SdbusNm(popup_handler)
     try:
-        nm.rescan()
-        threading.Thread(target=delayed_rescan, args=(nm,)).start()
+        # Запускаем сканирование
+        popup_handler("Запуск сканирования Wi-Fi...", level=1)
+        nm.rescan()  # Единственный вызов
         return make_json_response({"status": "scan_started"})
     except Exception as e:
+        popup_handler(f"Ошибка сканирования: {e}", level=2)
         return make_json_response({"status": "error", "message": str(e)}, status=500)
 @app.route("/wifi/monitor", methods=["POST"])
 def toggle_monitoring():
