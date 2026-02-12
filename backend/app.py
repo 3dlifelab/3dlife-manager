@@ -7,7 +7,7 @@ from sdbus_utils import SdbusNm  # твой класс
 from sdbus_block.networkmanager import enums
 
 app = Flask(__name__)
-CORS(app)  # разрешает все домены (только для dev!)
+CORS(app, resources={r"/wifi/*": {"origins": "*"}})  # разрешает все домены (только для dev!)
 # Callback для сообщений (можно кастомизировать под GUI)
 def popup_handler(msg, level=0):
     print(f"[POPUP-{level}] {msg}")

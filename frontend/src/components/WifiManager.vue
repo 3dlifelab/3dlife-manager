@@ -3,6 +3,7 @@
     <v-app-bar color="primary" dark>
       <v-app-bar-title>Wi-Fi Manager</v-app-bar-title>
       <v-spacer></v-spacer>
+      <title>test</title>
       <v-btn icon @click="refreshNetworks">
         <v-icon>mdi-refresh</v-icon>
       </v-btn>

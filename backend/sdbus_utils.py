@@ -1,6 +1,7 @@
 import logging
 import subprocess
 from uuid import uuid4
+import os
 
 import sdbus
 from sdbus_block.networkmanager import (
@@ -103,6 +104,8 @@ class SdbusNm:
         self.popup = popup_callback
 
     def ensure_nm_running(self):
+        # if not os.path.exists("/run/dbus/system_bus_socket"):
+        #     raise RuntimeError("Host D-Bus system socket not mounted. Add volume in docker-compose.")
         try:
             status = subprocess.run(
                 ["systemctl", "is-active", "--quiet", "NetworkManager"]
