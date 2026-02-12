@@ -161,7 +161,7 @@
 
 <script setup>
 import { ref, reactive } from 'vue';
-const API_BASE = 'http://0.0.0.0:5001;' // Flask слушает порт 5001
+const API_BASE = 'http://192.168.4.1:5001' // Flask слушает порт 5001
 // === Моковые данные ===
 
 
