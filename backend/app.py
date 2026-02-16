@@ -8,10 +8,10 @@ from sdbus_block.networkmanager import enums
 
 app = Flask(__name__)
 CORS(app, resources={r"/wifi/*": {"origins": "*"}})  # разрешает все домены (только для dev!)
+
 # Callback для сообщений (можно кастомизировать под GUI)
 def popup_handler(msg, level=0):
     print(f"[POPUP-{level}] {msg}")
-
 
 # Вспомогательная функция для красивого JSON
 def make_json_response(data, status=200):
@@ -20,11 +20,18 @@ def make_json_response(data, status=200):
         status=status,
         mimetype="application/json"
     )
-    
+
+# Константы для проверки подключения
+CONNECTION_TIMEOUT = 10  # секунд на попытку подключения
+POLL_INTERVAL = 1        # интервал опроса статуса
+
 @app.route("/wifi/networks", methods=["GET"])
 def list_networks():
     nm = SdbusNm(popup_handler)
-    rescan_networks
+    # Исправлено: был вызов функции вместо метода nm.rescan()
+    nm.rescan() 
+    # Небольшая задержка, чтобы сканирование успело начаться (опционально)
+    time.sleep(0.5) 
     networks = nm.get_networks()
     return make_json_response(networks)
 
@@ -42,33 +49,135 @@ def wifi_status():
     }
     return make_json_response(data)
 
-
 @app.route("/wifi/connect", methods=["POST"])
 def connect_network():
     nm = SdbusNm(popup_handler)
     data = request.json
     ssid = data.get("ssid")
-    password = data.get("password", "").strip()  # убираем пробелы
+    # Получаем пароль, но не передаем его, если сеть известна
+    password = data.get("password", "").strip()
     eap_method = data.get("eap_method", None)
     identity = data.get("identity", "")
     phase2 = data.get("phase2", None)
 
-    # Проверяем, существует ли уже соединение с этой сетью
-    if not nm.is_known(ssid):
-        # Только если сеть НОВАЯ — добавляем её
-        result = nm.add_network(ssid, password, eap_method, identity, phase2)
-        if "error" in result:
-            return make_json_response(result, status=400)
-    else:
-        popup_handler(f"Сеть {ssid} уже известна, используем существующее соединение", level=1)
+    if not ssid:
+        return make_json_response({"error": "SSID is required"}, status=400)
 
-    # Подключаемся (активируем соединение)
+    is_known = nm.is_known(ssid)
+    popup_handler(f"Сеть {ssid} {'известна' if is_known else 'новая'}, пароль предоставлен: {bool(password)}", level=1)
+
+    # 1. Добавляем профиль ТОЛЬКО если сеть новая
+    if not is_known:
+        if not password:
+            return make_json_response({"error": "Password required for new network"}, status=400)
+        
+        try:
+            result = nm.add_network(ssid, password, eap_method, identity, phase2)
+            if "error" in result:
+                return make_json_response(result, status=400)
+            popup_handler(f"Профиль для {ssid} создан", level=1)
+        except Exception as e:
+            error_msg = str(e)
+            # Ловим ошибку неверного формата пароля (WPA2 требует 8-63 символа)
+            if "psk: property is invalid" in error_msg:
+                return make_json_response({
+                    "error": "Invalid password format (WPA2 requires 8-63 characters)"
+                }, status=400)
+            return make_json_response({"error": f"Failed to add network: {error_msg}"}, status=500)
+    else:
+        # Для известной сети пароль не передаем в add_network
+        popup_handler(f"Используем существующий профиль для {ssid}", level=1)
+
+    # 2. Инициируем подключение
     try:
         nm.connect(ssid)
-        return make_json_response({"status": "connecting", "ssid": ssid})
     except Exception as e:
-        return make_json_response({"error": str(e)}, status=500)
+        # Если ошибка при подключении к известной сети — возможно пароль изменился
+        if is_known:
+            popup_handler(f"Ошибка подключения к известной сети, пробуем обновить...", level=2)
+            try:
+                # Пытаемся пересоздать профиль с новым паролем если он был передан
+                if password:
+                    nm.delete_network(ssid)
+                    nm.add_network(ssid, password, eap_method, identity, phase2)
+                    nm.connect(ssid)
+                else:
+                    raise e
+            except Exception as retry_e:
+                return make_json_response({"error": str(retry_e)}, status=500)
+        else:
+            nm.delete_network(ssid)
+            return make_json_response({"error": str(e)}, status=500)
 
+    # 3. Ожидание и ВАЛИДАЦИЯ подключения
+    popup_handler(f"Ожидание результата подключения к {ssid}...", level=1)
+    
+    CONNECTION_TIMEOUT = 5
+    POLL_INTERVAL = 1
+    STABLE_SUCCESS_COUNT = 3
+    
+    start_time = time.time()
+    success_count = 0
+    final_status = "failed"
+    error_message = "Connection timeout"
+
+    while (time.time() - start_time) < CONNECTION_TIMEOUT:
+        time.sleep(POLL_INTERVAL)
+        
+        nm.monitor_connection_status()
+        current_state = nm.wifi_state
+        ip_address = nm.get_ip_address()
+        
+        popup_handler(f"State: {current_state}, IP: {ip_address}", level=1)
+
+        # Явный провал авторизации
+        if current_state == enums.DeviceState.FAILED:
+            error_message = "Authentication failed (wrong password)"
+            popup_handler("Состояние FAILED - неверный пароль", level=2)
+            break
+        
+        # Успешное подключение
+        if current_state == enums.DeviceState.ACTIVATED:
+            if ip_address and ip_address != "0.0.0.0" and not ip_address.startswith("169.254"):
+                success_count += 1
+                popup_handler(f"Успешная проверка {success_count}/{STABLE_SUCCESS_COUNT}", level=1)
+                
+                if success_count >= STABLE_SUCCESS_COUNT:
+                    final_status = "connected"
+                    popup_handler(f"Подключение подтверждено (IP: {ip_address})", level=0)
+                    break
+            else:
+                popup_handler("ACTIVATED но IP не получен, ждем...", level=1)
+                success_count = 0
+        else:
+            if success_count > 0:
+                error_message = "Connection lost during authentication"
+                popup_handler("Соединение разорвано в процессе авторизации", level=2)
+            success_count = 0
+
+    # 4. Обработка результата
+    if final_status == "connected":
+        return make_json_response({
+            "status": "connected", 
+            "ssid": ssid,
+            "message": "Password valid and connected",
+            "ip_address": nm.get_ip_address()
+        })
+    else:
+        # Если сеть была НОВАЯ и не подключилась — удаляем профиль
+        # Если сеть была ИЗВЕСТНАЯ — оставляем профиль (вдруг просто глюк сети)
+        if not is_known:
+            try:
+                nm.delete_network(ssid)
+                popup_handler(f"Профиль {ssid} удален после неудачи", level=1)
+            except:
+                pass
+            
+        return make_json_response({
+            "status": "failed", 
+            "ssid": ssid,
+            "error": error_message
+        }, status=401)
 
 @app.route("/wifi/disconnect", methods=["POST"])
 def disconnect_network():
@@ -96,13 +205,13 @@ def toggle_wifi():
 def rescan_networks():
     nm = SdbusNm(popup_handler)
     try:
-        # Запускаем сканирование
         popup_handler("Запуск сканирования Wi-Fi...", level=1)
-        nm.rescan()  # Единственный вызов
+        nm.rescan()
         return make_json_response({"status": "scan_started"})
     except Exception as e:
         popup_handler(f"Ошибка сканирования: {e}", level=2)
         return make_json_response({"status": "error", "message": str(e)}, status=500)
+
 @app.route("/wifi/monitor", methods=["POST"])
 def toggle_monitoring():
     data = request.json
@@ -110,6 +219,7 @@ def toggle_monitoring():
     nm = SdbusNm(popup_handler)
     nm.enable_monitoring(enable)
     return make_json_response({"monitoring": enable})
+
 @app.route("/wifi/monitor/status", methods=["GET"])
 def monitor_status():
     nm = SdbusNm(popup_handler)
@@ -134,10 +244,6 @@ def monitor_status():
         "monitoring": nm.monitor_connection,
     })
 
-def delayed_rescan(nm, delay=2):
-    nm.rescan()
-    time.sleep(delay)
-
 if __name__ == "__main__":
     # use_reloader=False критично для корректной работы D-Bus
-    app.run(host="0.0.0.0", port=5001, debug=True)
+    app.run(host="0.0.0.0", port=5001, debug=True, use_reloader=False)
