@@ -38,20 +38,29 @@
           style="width: 100%; max-width: 100%; padding-top: 64px;"
           hover>
 
-            <template v-slot:item.ssid="{ item }">
-            <div class="d-flex align-center">
-              <span class="font-weight-medium">
-                <div :class="item.connected ? 'connected-cell font-weight-bold' : ''">
-                  {{ item.ssid }}
-                </div>
-              </span>
-              <v-icon
-                v-if="item.known"
-                size="x-small"
-                color="blue"
-                class="ms-1"
-                icon="mdi-heart"
-              ></v-icon>
+          <template v-slot:item.secured="{ item }">
+            <div :class="item.connected ? 'connected-cell' : ''">
+              <!-- Индикатор подключения -->
+              <div v-if="connectingSsid === item.ssid" class="connecting-indicator">
+                <v-progress-circular
+                  size="16"
+                  width="2"
+                  color="primary"
+                  indeterminate
+                  class="me-2"
+                ></v-progress-circular>
+                <span class="text-caption">Подключение...</span>
+              </div>
+              
+              <!-- Обычный статус -->
+              <v-chip
+                v-else
+                :color="getChipColor(item)"
+                size="small"
+                :variant="item.connected ? 'flat' : 'outlined'"
+              >
+                {{ getStatusText(item) }}
+              </v-chip>
             </div>
           </template>
           <template v-slot:item.strength="{ item }">
@@ -63,17 +72,6 @@
                   backgroundColor: getSignalColor(item.strength)
                 }"
               ></div>
-            </div>
-          </template>
-          <template v-slot:item.secured="{ item }">
-            <div :class="item.connected ? 'connected-cell' : ''">
-              <v-chip
-                :color="getChipColor(item)"
-                size="small"
-                :variant="item.connected ? 'flat' : 'outlined'"
-              >
-                {{ getStatusText(item) }}
-              </v-chip>
             </div>
           </template>
           <template v-slot:item.actions="{ item }">
@@ -161,7 +159,7 @@
 
 <script setup>
 import { ref, reactive } from 'vue';
-const API_BASE = 'http://192.168.4.1:5001' // Flask слушает порт 5001
+const API_BASE = 'http://localhost:5001' // Flask слушает порт 5001
 // === Моковые данные ===
 
 
@@ -170,6 +168,8 @@ const networks = ref([]);
 const totalNetworks = ref(0);
 const loading = ref(false);
 const search = ref('');
+const connectingSsid = ref(null); // SSID сети, к которой идёт подключение
+const connectionStartTime = ref(null); // Для анимации прогресса
 const dialog = ref(false);
 const password = ref('');
 const snackbar = reactive({
@@ -219,7 +219,8 @@ const loadConnectionStatus = async () => {
 };
 const refreshNetworks = async () => {
   loading.value = true;
-
+  connectingSsid.value = null; // ✅ Сброс индикатора при обновлении
+  connectionStartTime.value = null;
   try {
     // 1. Запускаем сканирование
     await fetch(`${API_BASE}/wifi/rescan`, { method: 'POST' });
@@ -290,6 +291,7 @@ const getSignalStrength = (strength) => {
   return strength / 5; // преобразуем в 0-1 для рейтинга из 5 звёзд
 };
 
+// === Исправленная функция forgetNetwork ===
 const forgetNetwork = async (ssid) => {
   try {
     const res = await fetch(`${API_BASE}/wifi/network/${encodeURIComponent(ssid)}`, {
@@ -301,15 +303,16 @@ const forgetNetwork = async (ssid) => {
     const result = await res.json();
     showMessage(`Сеть "${result.ssid}" забыта`, 'info');
 
-    // Обновляем локальный список: помечаем как not known
-    const net = networks.value.find(n => n.ssid === ssid);
-    if (net) {
-      net.known = false;
-      net.secured = false; // опционально: если хочется обнулить
-    }
+    // ❌ УДАЛЕНО: Не меняем net.secured и net.known вручную!
+    // const net = networks.value.find(n => n.ssid === ssid);
+    // if (net) {
+    //   net.known = false;
+    //   net.secured = false; // <-- ЭТО БЫЛО ПРИЧИНОЙ СТАТУСА "ОТКРЫТАЯ"
+    // }
 
-    // Перезагружаем статус на всякий случай
-    loadConnectionStatus();
+    // ✅ ПРАВИЛЬНО: Полностью перезагружаем список сетей
+    // Это обновит known=false и сохранит правильный secured (WPA2/Open)
+    await refreshNetworks(); 
 
   } catch (err) {
     showMessage(`Ошибка при удалении: ${err.message}`, 'error');
@@ -338,8 +341,9 @@ const getChipColor = (item) => {
 };
 
 const getRowClass = (item) => {
-  console.log('getRowClass:', item.ssid, 'connected:', item.connected);
-  return item.connected ? 'connected-network-row' : '';
+  if (item.connected) return 'connected-network-row';
+  if (connectingSsid.value === item.ssid) return 'connecting-network-row';
+  return '';
 };
 
 const openConnectDialog = (network) => {
@@ -354,71 +358,73 @@ const onRowClick = (event, item) => {
 const confirmAction = async () => {
   const net = currentNetwork.value;
 
+  // Проверка пароля
+  if (net.secured && !net.known && !password.value) {
+    showMessage('Введите пароль для новой сети!', 'warning');
+    return;
+  }
+
+  const ssid = net.ssid;
+  const pass = password.value || '';
+  const wasKnown = net.known;
+
+  // ✅ Закрываем диалог сразу
+  dialog.value = false;
+
+  // ✅ Устанавливаем индикатор подключения
+  connectingSsid.value = ssid;
+  connectionStartTime.value = Date.now();
+
   if (net.connected) {
     // === Отключение ===
     try {
       const res = await fetch(`${API_BASE}/wifi/disconnect`, { method: 'POST' });
       if (!res.ok) throw new Error('Ошибка отключения');
 
-      // Обновляем состояние
-      networks.value.forEach(n => {
-        if (n.ssid === net.ssid) n.connected = false;
-      });
-      currentConnection.value = null;
-      showMessage(`Отключено от ${net.ssid}`, 'info');
+      showMessage(`Отключено от ${ssid}`, 'info');
     } catch (err) {
       showMessage(`Ошибка: ${err.message}`, 'error');
+    } finally {
+      connectingSsid.value = null;
+      connectionStartTime.value = null;
+      await refreshNetworks(); // ✅ Обновляем список
     }
   } else {
     // === Подключение ===
-    if (net.secured && !net.known && !password.value) {
-      // Только если сеть защищена, НО не сохранена (не known), И нет пароля — тогда ошибка
-      showMessage('Введите пароль для новой сети!', 'warning');
-      return;
-    }
-
     try {
       const res = await fetch(`${API_BASE}/wifi/connect`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          ssid: net.ssid,
-          password: password.value || ''  // может быть пустым, если сеть known
+          ssid: ssid,
+          password: pass
         })
       });
 
       const result = await res.json();
 
       if (res.ok) {
-        // Успешно начато подключение
-        networks.value.forEach(n => {
-          n.connected = n.ssid === net.ssid;
-        });
-
-        // Обновим статус подключения (включая IP)
-        setTimeout(loadConnectionStatus, 1000);
-
-        const msg = net.known
-          ? `Подключаюсь к сохранённой сети: ${net.ssid}`
-          : `Подключение к новой сети: ${net.ssid}`;
-        showMessage(msg, 'success');
+        showMessage(`✅ Подключено к ${ssid}`, 'success');
       } else {
-        throw new Error(result.message || 'Не удалось подключиться');
+        showMessage(`❌ ${result.error || 'Не удалось подключиться'}`, 'error');
       }
     } catch (err) {
-      showMessage(`Ошибка: ${err.message}`, 'error');
+      showMessage(`❌ Ошибка: ${err.message}`, 'error');
+    } finally {
+      // ✅ Сбрасываем индикатор и обновляем список в любом случае
+      connectingSsid.value = null;
+      connectionStartTime.value = null;
+      await refreshNetworks(); // ✅ Ключевое изменение
     }
   }
 
-  // Закрываем диалог
-  dialog.value = false;
-
-  // Сбрасываем пароль только если не планируем повторное использование
+  // Сброс пароля
   if (net.secured && !net.known) {
-    password.value = ''; // очищаем для безопасности
+    password.value = '';
   }
-  // Если known — можно оставить, но обычно не нужно
 };
+
+
 
 const showMessage = (msg, color = 'success') => {
   snackbar.message = msg;
@@ -433,7 +439,7 @@ const currentConnection = ref(null); // { ssid: '...', ip: '...' }
 
 // Загрузка при старте
 watch(
-  () => networks.value,
+
   () => {
     loadConnectionStatus();
   },
@@ -482,5 +488,29 @@ onMounted(() => {
   height: 100%;
   border-radius: 3px;
   transition: background-color 0.2s, width 0.3s;
+}
+
+.connecting-indicator {
+  display: flex;
+  align-items: center;
+  padding: 4px 8px;
+  background-color: rgba(25, 118, 210, 0.08);
+  border-radius: 4px;
+  border: 1px dashed rgba(25, 118, 210, 0.3);
+}
+
+/* Пульсация для строки которая подключается */
+.connecting-network-row {
+  animation: pulse-row 2s ease-in-out infinite;
+  background-color: rgba(25, 118, 210, 0.1) !important;
+}
+
+@keyframes pulse-row {
+  0%, 100% {
+    background-color: rgba(25, 118, 210, 0.08) !important;
+  }
+  50% {
+    background-color: rgba(25, 118, 210, 0.15) !important;
+  }
 }
 </style>
