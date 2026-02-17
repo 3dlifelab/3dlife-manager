@@ -21,7 +21,7 @@ def make_json_response(data, status=200):
         mimetype="application/json"
     )
 
-# Константы для проверки подключения
+# Константы для проверки 
 CONNECTION_TIMEOUT = 10  # секунд на попытку подключения
 POLL_INTERVAL = 1        # интервал опроса статуса
 
@@ -37,17 +37,46 @@ def list_networks():
 
 
 @app.route("/wifi/status", methods=["GET"])
+@app.route("/wifi/status", methods=["GET"])
 def wifi_status():
     nm = SdbusNm(popup_handler)
+    
+    # === Wi-Fi статус ===
     connected_ap = nm.get_connected_ap()
     ssid = connected_ap.ssid.decode("utf-8") if connected_ap else None
-    data = {
+    
+    wifi_data = {
         "enabled": nm.is_wifi_enabled(),
-        "connected_bssid": nm.get_connected_bssid(),
-        "ip_address": nm.get_ip_address(),
-        "name": ssid
+        "connected": connected_ap is not None,
+        "ssid": ssid,
+        "ip_address": nm.get_ip_address() if connected_ap else None
     }
-    return make_json_response(data)
+    
+    # === Ethernet статус (НОВОЕ) ===
+    ethernet_data = nm.get_ethernet_status()
+    
+    # === Определяем активное соединение для отображения ===
+    # Приоритет: Ethernet > Wi-Fi
+    if ethernet_data["connected"]:
+        active_connection = {
+            "type": "ethernet",
+            "name": "Ethernet",
+            "ip": ethernet_data["ip_address"]
+        }
+    elif wifi_data["connected"]:
+        active_connection = {
+            "type": "wifi",
+            "name": wifi_data["ssid"],
+            "ip": wifi_data["ip_address"]
+        }
+    else:
+        active_connection = None
+    
+    return make_json_response({
+        "wifi": wifi_data,
+        "ethernet": ethernet_data,
+        "active_connection": active_connection  # Готовые данные для шапки
+    })
 
 @app.route("/wifi/connect", methods=["POST"])
 def connect_network():

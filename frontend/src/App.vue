@@ -5,15 +5,23 @@
       <v-app-bar-title>3DL!FE</v-app-bar-title>
 
       <!-- Правая сторона шапки: статус подключения -->
-      <div class="text-end mx-2" style="white-space: nowrap;">
-        <div v-if="currentConnection" class="text-caption">
-          <strong>{{ currentConnection.ssid }}</strong><br>
-          <span>{{ currentConnection.ip }}</span>
-        </div>
-        <div v-else class="text-caption">
-          Не подключено
-        </div>
+    <div class="text-end mx-2" style="white-space: nowrap;">
+      <div v-if="activeConnection" class="text-caption">
+        <!-- Иконка типа подключения -->
+        <v-icon size="small" class="me-1">
+          {{ activeConnection.type === 'ethernet' ? 'mdi-ethernet' : 'mdi-wifi' }}
+        </v-icon>
+        
+        <!-- Название и IP -->
+        <strong>{{ activeConnection.name }}</strong><br>
+        <span class="text-medium-emphasis">{{ activeConnection.ip }}</span>
       </div>
+      
+      <div v-else class="text-caption text-medium-emphasis">
+        <v-icon size="small" class="me-1">mdi-wifi-off</v-icon>
+        Не подключено
+      </div>
+    </div>
 
       <!-- Кнопка обновить -->
       <v-btn icon @click="refreshNetworks">
@@ -159,7 +167,7 @@
 
 <script setup>
 import { ref, reactive } from 'vue';
-const API_BASE = 'http://localhost:5001' // Flask слушает порт 5001
+const API_BASE = 'http://192.168.4.1:5001' // Flask слушает порт 5001
 // === Моковые данные ===
 
 
@@ -172,6 +180,9 @@ const connectingSsid = ref(null); // SSID сети, к которой идёт �
 const connectionStartTime = ref(null); // Для анимации прогресса
 const dialog = ref(false);
 const password = ref('');
+const activeConnection = ref(null); // { type: 'ethernet'|'wifi', name: '...', ip: '...' }
+const wifiStatus = ref(null);       // Детальный статус Wi-Fi
+const ethernetStatus = ref(null);   // Детальный статус Ethernet
 const snackbar = reactive({
   show: false,
   message: '',
@@ -188,7 +199,7 @@ const headers = [
   // { title: 'Действия', key: 'actions', sortable: false },
 ];
 
-// === Методы ===
+// === Методы ===1
 const loadConnectionStatus = async () => {
   try {
     const res = await fetch(`${API_BASE}/wifi/status`);
@@ -196,25 +207,21 @@ const loadConnectionStatus = async () => {
 
     const data = await res.json();
 
-    // === Обновляем currentConnection с реальным IP ===
-    if (data.name) {
-      currentConnection.value = {
-        ssid: data.name,
-        ip: data.ip_address || '—', // реальный IP от NetworkManager
-      };
+    // Сохраняем детальные статусы
+    wifiStatus.value = data.wifi;
+    ethernetStatus.value = data.ethernet;
+    
+    // Используем готовое активное соединение с бэкенда
+    activeConnection.value = data.active_connection;
 
-      // === Обновляем connected-статус в списке сетей ===
-      networks.value.forEach(network => {
-        network.connected = (network.ssid === data.name);
-      });
-    } else {
-      currentConnection.value = null;
-      networks.value.forEach(n => { n.connected = false; });
-    }
+    // Синхронизируем статус подключения в списке сетей
+    networks.value.forEach(network => {
+      network.connected = (data.wifi.connected && network.ssid === data.wifi.ssid);
+    });
+    
   } catch (err) {
     console.warn('Ошибка при обновлении статуса:', err);
-    currentConnection.value = null;
-    networks.value.forEach(n => { n.connected = false; });
+    activeConnection.value = null;
   }
 };
 const refreshNetworks = async () => {

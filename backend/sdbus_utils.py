@@ -85,14 +85,26 @@ def WifiChannels(freq: str):
 
 
 class SdbusNm:
-
+    def popup_handler(self,msg, level=0):
+        print(f"[POPUP-{level}] {msg}")
     def __init__(self, popup_callback):
-        self.ensure_nm_running()
-        self.system_bus = sdbus.sd_bus_open_system()  # We need system bus
+        self.popup = popup_callback  # ← Сначала сохраняем колбэк
+        
+        # Инициализация D-Bus
+        self.system_bus = sdbus.sd_bus_open_system()
         if self.system_bus is None:
-            return None
+            return
+        
         sdbus.set_default_bus(self.system_bus)
+        
+        # Создание объекта NetworkManager
         self.nm = NetworkManager()
+        
+        # ✅ Проверка ПОСЛЕ создания объекта
+        if not self.ensure_nm_running():
+            raise RuntimeError("NetworkManager не отвечает")
+        
+        # Остальная инициализация
         self.wlan_device = (
             self.get_wireless_interfaces()[0]
             if self.get_wireless_interfaces()
@@ -101,20 +113,16 @@ class SdbusNm:
         self.wifi = self.wlan_device is not None
         self.monitor_connection = False
         self.wifi_state = -1
-        self.popup = popup_callback
 
     def ensure_nm_running(self):
-        # if not os.path.exists("/run/dbus/system_bus_socket"):
-        #     raise RuntimeError("Host D-Bus system socket not mounted. Add volume in docker-compose.")
+        """Проверяет доступность NetworkManager через D-Bus"""
         try:
-            status = subprocess.run(
-                ["systemctl", "is-active", "--quiet", "NetworkManager"]
-            )
-            if status.returncode != 0:
-                raise RuntimeError("Failed to detect NetworkManager service")
-        except FileNotFoundError as e:
-            logging.exception(f"{e}")
-            raise RuntimeError(f"{e}") from e
+            # Пытаемся получить список устройств — если NM не работает, тут будет ошибка
+            _ = self.nm.get_devices()
+            return True
+        except Exception as e:
+            self.popup(f"NetworkManager недоступен: {e}", 2)
+            return False
 
     def is_wifi_enabled(self):
         return self.nm.wireless_enabled
@@ -360,6 +368,77 @@ class SdbusNm:
     def toggle_wifi(self, enable):
         self.nm.wireless_enabled = enable
 
+    def get_ethernet_status(self):
+        import subprocess
+        import re
+        
+        try:
+            # 1. Получаем список Ethernet интерфейсов через ip command
+            result = subprocess.run(
+                ['/usr/bin/ip', '-o', 'link', 'show'],
+                capture_output=True, text=True, timeout=5
+            )
+            
+            ethernet_interfaces = []
+            for line in result.stdout.split('\n'):
+                if line.strip():
+                    parts = line.split(': ')
+                    if len(parts) >= 2:
+                        iface_name = parts[1].split('@')[0]
+                        # Пропускаем loopback и виртуальные интерфейсы
+                        if iface_name not in ['lo', 'docker0', 'br-'] and \
+                        (iface_name.startswith('eth') or iface_name.startswith('end')):
+                            ethernet_interfaces.append(iface_name)
+            
+            self.popup(f"Найдено Ethernet интерфейсов: {ethernet_interfaces}", 1)
+            
+            if not ethernet_interfaces:
+                return {"connected": False, "ip_address": None, "state": 0, "interface": None}
+            
+            # 2. Проверяем каждый интерфейс
+            for iface in ethernet_interfaces:
+                # Проверка наличия линка (кабель подключен)
+                try:
+                    with open(f'/sys/class/net/{iface}/carrier', 'r') as f:
+                        carrier = f.read().strip()
+                    link_up = carrier == '1'
+                except:
+                    link_up = False
+                
+                # Получаем IP адрес
+                ip_address = None
+                if link_up:
+                    result = subprocess.run(
+                        ['/usr/bin/ip', '-4', 'addr', 'show', iface],
+                        capture_output=True, text=True, timeout=5
+                    )
+                    match = re.search(r'inet (\d+\.\d+\.\d+\.\d+)', result.stdout)
+                    if match:
+                        ip_address = match.group(1)
+                
+                self.popup(f"Ethernet {iface}: link={link_up}, ip={ip_address}", 1)
+                
+                # Если есть IP — считаем подключенным
+                if link_up and ip_address:
+                    return {
+                        "connected": True,
+                        "ip_address": ip_address,
+                        "state": 100,
+                        "interface": iface
+                    }
+            
+            # Кабель есть, но IP нет
+            return {
+                "connected": False,
+                "ip_address": None,
+                "state": 30,  # DISCONNECTED
+                "interface": ethernet_interfaces[0] if ethernet_interfaces else None
+            }
+            
+        except Exception as e:
+            self.popup(f"Ошибка получения Ethernet статуса: {e}", 2)
+            return {"connected": False, "ip_address": None, "state": 0, "interface": None}
+        
     def monitor_connection_status(self):
         state = self.wlan_device.state
         if self.wifi_state != state:
@@ -394,7 +473,6 @@ class SdbusNm:
     def enable_monitoring(self, enable):
         self.monitor_connection = enable
 
-def popup_handler(msg, level=0):
-    print(f"[POPUP-{level}] {msg}")
+
 
 
