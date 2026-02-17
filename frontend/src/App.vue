@@ -279,7 +279,7 @@ const refreshNetworks = async () => {
         totalNetworks.value = networks.value.length;
         await loadConnectionStatus();
       } catch (e) {
-        showMessage('Не удалось загрузить даже без сканирования', 'error');
+        showMessage('Не удалось загрузить', 'error');
         networks.value = [];
       } finally {
         loading.value = false;
