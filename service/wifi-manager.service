@@ -1,0 +1,33 @@
+[Unit]
+Description=WiFi Manager Application
+After=network.target NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=simple
+User=orto
+Group=orto
+WorkingDirectory=/home/orto/3dlife-manager/backend
+
+# Активируем виртуальное окружение и запускаем Flask
+Environment="PATH=/home/orto/3dlife-manager/backend/venv/bin"
+Environment="PYTHONUNBUFFERED=1"
+Environment="FLASK_ENV=production"
+
+ExecStart=/home/orto/3dlife-manager/backend/venv/bin/gunicorn --workers 2 --bind 127.0.0.1:5000 app:app
+
+# Автоматический перезапуск при падении
+Restart=always
+RestartSec=5
+
+# Логирование
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wifi-manager
+
+# Безопасность (опционально)
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
