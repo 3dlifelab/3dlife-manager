@@ -167,7 +167,7 @@
 
 <script setup>
 import { ref, reactive } from 'vue';
-const API_BASE = 'http://192.168.4.1:5001' // Flask слушает порт 5001
+const API_BASE = 'http://localhost:5001' // Flask слушает порт 5001
 // === Моковые данные ===
 
 
@@ -202,7 +202,7 @@ const headers = [
 // === Методы ===1
 const loadConnectionStatus = async () => {
   try {
-    const res = await fetch(`${API_BASE}/wifi/status`);
+    const res = await fetch(`/wifi/status`);
     if (!res.ok) throw new Error('Не удалось загрузить статус');
 
     const data = await res.json();
@@ -230,13 +230,13 @@ const refreshNetworks = async () => {
   connectionStartTime.value = null;
   try {
     // 1. Запускаем сканирование
-    await fetch(`${API_BASE}/wifi/rescan`, { method: 'POST' });
+    await fetch(`wifi/rescan`, { method: 'POST' });
     
     // 2. Ждём 1.5 секунды — время на сканирование
     setTimeout(async () => {
       try {
         // 3. Получаем обновлённый список сетей
-        const res = await fetch(`${API_BASE}/wifi/networks`);
+        const res = await fetch(`/wifi/networks`);
         if (!res.ok) throw new Error('Не удалось загрузить сети');
         
         const rawData = await res.json(); // Массив объектов
@@ -273,7 +273,7 @@ const refreshNetworks = async () => {
     // На всякий случай — попробуем сразу получить сети без rescan
     setTimeout(async () => {
       try {
-        const res = await fetch(`${API_BASE}/wifi/networks`);
+        const res = await fetch(`/wifi/networks`);
         const data = await res.json();
         networks.value = data.map(net => ({
           ssid: net.SSID,
@@ -301,7 +301,7 @@ const getSignalStrength = (strength) => {
 // === Исправленная функция forgetNetwork ===
 const forgetNetwork = async (ssid) => {
   try {
-    const res = await fetch(`${API_BASE}/wifi/network/${encodeURIComponent(ssid)}`, {
+    const res = await fetch(`/wifi/network/${encodeURIComponent(ssid)}`, {
       method: 'DELETE',
     });
 
@@ -385,7 +385,7 @@ const confirmAction = async () => {
   if (net.connected) {
     // === Отключение ===
     try {
-      const res = await fetch(`${API_BASE}/wifi/disconnect`, { method: 'POST' });
+      const res = await fetch(`/wifi/disconnect`, { method: 'POST' });
       if (!res.ok) throw new Error('Ошибка отключения');
 
       showMessage(`Отключено от ${ssid}`, 'info');
@@ -399,7 +399,7 @@ const confirmAction = async () => {
   } else {
     // === Подключение ===
     try {
-      const res = await fetch(`${API_BASE}/wifi/connect`, {
+      const res = await fetch(`/wifi/connect`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

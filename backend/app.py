@@ -141,7 +141,7 @@ def connect_network():
     # 3. Ожидание и ВАЛИДАЦИЯ подключения
     popup_handler(f"Ожидание результата подключения к {ssid}...", level=1)
     
-    CONNECTION_TIMEOUT = 5
+    CONNECTION_TIMEOUT = 8
     POLL_INTERVAL = 1
     STABLE_SUCCESS_COUNT = 3
     
@@ -273,6 +273,4 @@ def monitor_status():
         "monitoring": nm.monitor_connection,
     })
 
-if __name__ == "__main__":
-    # use_reloader=False критично для корректной работы D-Bus
-    app.run(host="0.0.0.0", port=5001, debug=True, use_reloader=False)
+
