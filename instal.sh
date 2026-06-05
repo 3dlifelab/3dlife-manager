@@ -43,7 +43,7 @@ FRONTEND_DIST_PATH="./dist"
 
 # Путь к вашему готовому nginx-конфигу
 YOUR_NGINX_CONFIG="./service/3dlife-manager"
-YOUR_NGINX_CONFIG_NAME="3dlife-manager"
+CONFIG_FILENAME="3dlife-manager"
 # Репозиторий с фронтендом (в формате owner/repo)
 FRONTEND_REPO="3dlifelab/3dlife-manager-frontend"
 
@@ -342,36 +342,44 @@ log_info "Frontend установлен (версия: $VERSION)"
 # ШАГ 9: Настройка Nginx (используем ваш готовый конфиг)
 # ============================================================================
 
-log_info "Шаг 8: Настройка Nginx..."
+og_info "Шаг 8: Настройка Nginx..."
 
-# Путь к вашему готовому nginx-конфигу (измените в начале скрипта)
-# Например: YOUR_NGINX_CONFIG="./myapp.nginx.conf"
-NGINX_CONFIG="/etc/nginx/sites-available/"
+# Имя вашего файла конфигурации (убедитесь, что он заканчивается на .conf)
+# Если ваш файл называется просто "3dlife-manager", переименуйте его в "3dlife-manager.conf"
+ 
 
-# Строго проверяем наличие вашего готового файла конфига
+# Пути
+NGINX_AVAILABLE="/etc/nginx/sites-available/$CONFIG_FILENAME"
+NGINX_ENABLED="/etc/nginx/sites-enabled/$CONFIG_FILENAME"
+
+# 1. Проверяем наличие исходного файла конфига
 if [ ! -f "$YOUR_NGINX_CONFIG" ]; then
     log_error "Файл nginx-конфига не найден: $YOUR_NGINX_CONFIG"
-    log_error "Пожалуйста, положите ваш готовый .conf файл в директорию со скриптом"
-    log_error "и убедитесь, что переменная YOUR_NGINX_CONFIG в начале скрипта указывает на него."
+    log_error "Пожалуйста, проверьте путь к файлу в начале скрипта."
     exit 1
 fi
 
-# Копируем ваш готовый конфиг в директорию sites-available
-cp "$YOUR_NGINX_CONFIG" "$NGINX_CONFIG"
+# 2. Копируем ваш готовый конфиг в папку sites-available
+log_info "Копирование конфигурации в $NGINX_AVAILABLE..."
+cp "$YOUR_NGINX_CONFIG" "$NGINX_AVAILABLE"
 
-# Активируем сайт
-ln -sf "$NGINX_CONFIG/$YOUR_NGINX_CONFIG_NAME" /etc/nginx/sites-enabled/
+# 3. Создаем СИМВОЛИЧЕСКУЮ ССЫЛКУ на КОНКРЕТНЫЙ ФАЙЛ (не на папку!)
+log_info "Активация конфигурации..."
+ln -sf "$NGINX_AVAILABLE" "$NGINX_ENABLED"
 
-# Удаляем стандартный конфиг (если есть)
+# 4. Удаляем стандартный конфиг nginx, чтобы он не перехватывал порт 80
 rm -f /etc/nginx/sites-enabled/default
+# Также удалим ту самую ошибочную ссылку на папку, если она вдруг создалась
+rm -f /etc/nginx/sites-enabled/sites-available
 
-# Проверяем синтаксис
+# 5. Проверяем синтаксис Nginx
+log_info "Проверка синтаксиса Nginx..."
 if nginx -t; then
     systemctl restart nginx
-    log_info "Nginx настроен и перезапущен"
+    log_info "Nginx успешно настроен и перезапущен"
 else
-    log_error "Ошибка в конфигурации Nginx"
-    log_error "Проверьте ваш файл конфига: $YOUR_NGINX_CONFIG"
+    log_error "Ошибка в конфигурации Nginx!"
+    log_error "Проверьте файл: $YOUR_NGINX_CONFIG"
     exit 1
 fi
 
