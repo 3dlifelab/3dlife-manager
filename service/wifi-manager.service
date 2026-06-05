@@ -5,16 +5,16 @@ Wants=NetworkManager.service
 
 [Service]
 Type=simple
-User=orto
-Group=orto
-WorkingDirectory=/home/orto/3dlife-manager/backend
+User=artpro
+Group=artpro
+WorkingDirectory=/home/artpro/3dlife-manager-backend
 
 # Активируем виртуальное окружение и запускаем Flask
-Environment="PATH=/home/orto/3dlife-manager/backend/venv/bin"
+Environment="PATH=/home/artpro/3dlife-manager-backend/wifi-manager-env/bin"
 Environment="PYTHONUNBUFFERED=1"
 Environment="FLASK_ENV=production"
 
-ExecStart=/home/orto/3dlife-manager/backend/venv/bin/gunicorn --workers 2 --bind 127.0.0.1:5000 app:app
+ExecStart=/home/artpro/3dlife-manager-backend/wifi-manager-env/bin/bin/gunicorn --workers 2 --bind 127.0.0.1:5000 app:app
 
 # Автоматический перезапуск при падении
 Restart=always
