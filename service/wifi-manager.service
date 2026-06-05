@@ -14,7 +14,7 @@ Environment="PATH=/home/artpro/3dlife-manager-backend/wifi-manager-env/bin"
 Environment="PYTHONUNBUFFERED=1"
 Environment="FLASK_ENV=production"
 
-ExecStart=/home/artpro/3dlife-manager-backend/wifi-manager-env/bin/bin/gunicorn --workers 2 --bind 127.0.0.1:5000 app:app
+ExecStart=/home/artpro/3dlife-manager-backend/wifi-manager-env/bin/gunicorn --workers 2 --bind 127.0.0.1:5000 app:app
 
 # Автоматический перезапуск при падении
 Restart=always
