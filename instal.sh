@@ -43,12 +43,13 @@ FRONTEND_DIST_PATH="./dist"
 
 # Путь к вашему готовому nginx-конфигу
 YOUR_NGINX_CONFIG="./service/3dlife-manager"
-
+YOUR_NGINX_CONFIG_NAME="3dlife-manager"
 # Репозиторий с фронтендом (в формате owner/repo)
 FRONTEND_REPO="3dlifelab/3dlife-manager-frontend"
 
 # Имя вашего Flask-приложения (файл:переменная)
 FLASK_APP="app:app"
+
 
 # ============================================================================
 # ШАГ 1: Проверка прав root
@@ -359,7 +360,7 @@ fi
 cp "$YOUR_NGINX_CONFIG" "$NGINX_CONFIG"
 
 # Активируем сайт
-ln -sf "$NGINX_CONFIG" /etc/nginx/sites-enabled/
+ln -sf "$NGINX_CONFIG/$YOUR_NGINX_CONFIG_NAME" /etc/nginx/sites-enabled/
 
 # Удаляем стандартный конфиг (если есть)
 rm -f /etc/nginx/sites-enabled/default
