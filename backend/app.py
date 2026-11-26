@@ -1,276 +1,185 @@
-from flask import Flask, jsonify, request, Response
-from flask_cors import CORS
-import json
-import threading
+from ipaddress import IPv4Address
 import time
-from sdbus_utils import SdbusNm  # твой класс
+
+from flask import Flask, jsonify, request
+from sdbus import SdBusBaseError
 from sdbus_block.networkmanager import enums
 
+from sdbus_utils import SdbusNm
+
 app = Flask(__name__)
-CORS(app, resources={r"/wifi/*": {"origins": "*"}})  # разрешает все домены (только для dev!)
+CONNECTION_TIMEOUT = 8
+POLL_INTERVAL = 0.5
 
-# Callback для сообщений (можно кастомизировать под GUI)
-def popup_handler(msg, level=0):
-    print(f"[POPUP-{level}] {msg}")
 
-# Вспомогательная функция для красивого JSON
-def make_json_response(data, status=200):
-    return Response(
-        json.dumps(data, indent=2, ensure_ascii=False),
-        status=status,
-        mimetype="application/json"
-    )
+def network_manager():
+    return SdbusNm(lambda message, level=0: app.logger.debug("%s", message))
 
-# Константы для проверки 
-CONNECTION_TIMEOUT = 10  # секунд на попытку подключения
-POLL_INTERVAL = 1        # интервал опроса статуса
 
-@app.route("/wifi/networks", methods=["GET"])
+@app.before_request
+def check_request_origin():
+    if request.method not in {"POST", "DELETE"}:
+        return
+    origin = request.headers.get("Origin")
+    if origin and origin != request.host_url.rstrip("/"):
+        return jsonify(error="Cross-origin Wi-Fi changes are forbidden"), 403
+
+
+@app.errorhandler(SdBusBaseError)
+def dbus_error(error):
+    app.logger.error("NetworkManager operation failed (%s)", type(error).__name__)
+    return jsonify(error="NetworkManager operation failed"), 503
+
+
+def wifi_device_required(nm):
+    if not nm.wifi:
+        return jsonify(error="Wi-Fi adapter not found"), 503
+
+
+@app.get("/wifi/networks")
 def list_networks():
-    nm = SdbusNm(popup_handler)
-    # Исправлено: был вызов функции вместо метода nm.rescan()
-    nm.rescan() 
-    # Небольшая задержка, чтобы сканирование успело начаться (опционально)
-    time.sleep(0.5) 
-    networks = nm.get_networks()
-    return make_json_response(networks)
+    return jsonify(network_manager().get_networks())
 
 
-@app.route("/wifi/status", methods=["GET"])
-@app.route("/wifi/status", methods=["GET"])
+@app.get("/wifi/status")
 def wifi_status():
-    nm = SdbusNm(popup_handler)
-    
-    # === Wi-Fi статус ===
+    nm = network_manager()
     connected_ap = nm.get_connected_ap()
-    ssid = connected_ap.ssid.decode("utf-8") if connected_ap else None
-    
-    wifi_data = {
+    wifi = {
         "enabled": nm.is_wifi_enabled(),
         "connected": connected_ap is not None,
-        "ssid": ssid,
-        "ip_address": nm.get_ip_address() if connected_ap else None
+        "ssid": connected_ap.ssid.decode("utf-8", errors="surrogateescape") if connected_ap else None,
+        "ip_address": nm.get_ip_address() if connected_ap else None,
     }
-    
-    # === Ethernet статус (НОВОЕ) ===
-    ethernet_data = nm.get_ethernet_status()
-    
-    # === Определяем активное соединение для отображения ===
-    # Приоритет: Ethernet > Wi-Fi
-    if ethernet_data["connected"]:
-        active_connection = {
-            "type": "ethernet",
-            "name": "Ethernet",
-            "ip": ethernet_data["ip_address"]
-        }
-    elif wifi_data["connected"]:
-        active_connection = {
-            "type": "wifi",
-            "name": wifi_data["ssid"],
-            "ip": wifi_data["ip_address"]
-        }
-    else:
-        active_connection = None
-    
-    return make_json_response({
-        "wifi": wifi_data,
-        "ethernet": ethernet_data,
-        "active_connection": active_connection  # Готовые данные для шапки
-    })
+    ethernet = nm.get_ethernet_status()
 
-@app.route("/wifi/connect", methods=["POST"])
+    active_connection = None
+    if ethernet["connected"]:
+        active_connection = {"type": "ethernet", "name": "Ethernet", "ip": ethernet["ip_address"]}
+    elif wifi["connected"]:
+        active_connection = {"type": "wifi", "name": wifi["ssid"], "ip": wifi["ip_address"]}
+
+    return jsonify(wifi=wifi, ethernet=ethernet, active_connection=active_connection)
+
+
+@app.post("/wifi/connect")
 def connect_network():
-    nm = SdbusNm(popup_handler)
-    data = request.json
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify(error="Expected a JSON object"), 400
+
     ssid = data.get("ssid")
-    # Получаем пароль, но не передаем его, если сеть известна
-    password = data.get("password", "").strip()
-    eap_method = data.get("eap_method", None)
+    password = data.get("password", "")
+    eap_method = data.get("eap_method")
     identity = data.get("identity", "")
-    phase2 = data.get("phase2", None)
-
-    if not ssid:
-        return make_json_response({"error": "SSID is required"}, status=400)
-
-    is_known = nm.is_known(ssid)
-    popup_handler(f"Сеть {ssid} {'известна' if is_known else 'новая'}, пароль предоставлен: {bool(password)}", level=1)
-
-    # 1. Добавляем профиль ТОЛЬКО если сеть новая
-    if not is_known:
-        if not password:
-            return make_json_response({"error": "Password required for new network"}, status=400)
-        
-        try:
-            result = nm.add_network(ssid, password, eap_method, identity, phase2)
-            if "error" in result:
-                return make_json_response(result, status=400)
-            popup_handler(f"Профиль для {ssid} создан", level=1)
-        except Exception as e:
-            error_msg = str(e)
-            # Ловим ошибку неверного формата пароля (WPA2 требует 8-63 символа)
-            if "psk: property is invalid" in error_msg:
-                return make_json_response({
-                    "error": "Invalid password format (WPA2 requires 8-63 characters)"
-                }, status=400)
-            return make_json_response({"error": f"Failed to add network: {error_msg}"}, status=500)
-    else:
-        # Для известной сети пароль не передаем в add_network
-        popup_handler(f"Используем существующий профиль для {ssid}", level=1)
-
-    # 2. Инициируем подключение
+    phase2 = data.get("phase2")
+    if not isinstance(ssid, str) or not ssid:
+        return jsonify(error="SSID is required"), 400
     try:
-        nm.connect(ssid)
-    except Exception as e:
-        # Если ошибка при подключении к известной сети — возможно пароль изменился
-        if is_known:
-            popup_handler(f"Ошибка подключения к известной сети, пробуем обновить...", level=2)
+        valid_ssid = len(ssid.encode("utf-8", errors="surrogateescape")) <= 32
+        # NetworkManager accepts arbitrary SSID bytes, including non-UTF-8 values.
+    except UnicodeEncodeError:
+        valid_ssid = False
+    if not valid_ssid:
+        return jsonify(error="Invalid SSID"), 400
+    if not isinstance(password, str) or not isinstance(identity, str):
+        return jsonify(error="Password and identity must be strings"), 400
+    if any(value is not None and not isinstance(value, str) for value in (eap_method, phase2)):
+        return jsonify(error="EAP method and phase2 must be strings"), 400
+
+    nm = network_manager()
+    if error := wifi_device_required(nm):
+        return error
+    connection_path = nm.get_connection_path_by_ssid(ssid)
+    new_profile = connection_path is None
+    if new_profile:
+        result = nm.add_network(ssid, password, eap_method, identity, phase2)
+        if "error" in result:
+            return jsonify(result), 400
+        connection_path = result["path"]
+
+    connected = False
+    try:
+        active_path = nm.connect(connection_path)
+        deadline = time.monotonic() + CONNECTION_TIMEOUT
+        while time.monotonic() < deadline:
+            state = nm.wlan_device.state
+            if state == enums.DeviceState.FAILED:
+                return jsonify(status="failed", ssid=ssid, error="Wi-Fi activation failed"), 409
+            if state == enums.DeviceState.ACTIVATED:
+                ip_address = nm.get_ip_address(active_path)
+                if ip_address:
+                    address = IPv4Address(ip_address)
+                    if not address.is_unspecified and not address.is_link_local:
+                        connected = True
+                        return jsonify(status="connected", ssid=ssid, ip_address=ip_address)
+            time.sleep(POLL_INTERVAL)
+        return jsonify(status="failed", ssid=ssid, error="Connection timeout"), 504
+    finally:
+        if new_profile and not connected:
             try:
-                # Пытаемся пересоздать профиль с новым паролем если он был передан
-                if password:
-                    nm.delete_network(ssid)
-                    nm.add_network(ssid, password, eap_method, identity, phase2)
-                    nm.connect(ssid)
-                else:
-                    raise e
-            except Exception as retry_e:
-                return make_json_response({"error": str(retry_e)}, status=500)
-        else:
-            nm.delete_network(ssid)
-            return make_json_response({"error": str(e)}, status=500)
+                nm.delete_connection_path(connection_path)
+            except SdBusBaseError:
+                app.logger.exception("Could not remove failed Wi-Fi profile")
 
-    # 3. Ожидание и ВАЛИДАЦИЯ подключения
-    popup_handler(f"Ожидание результата подключения к {ssid}...", level=1)
-    
-    CONNECTION_TIMEOUT = 8
-    POLL_INTERVAL = 1
-    STABLE_SUCCESS_COUNT = 3
-    
-    start_time = time.time()
-    success_count = 0
-    final_status = "failed"
-    error_message = "Connection timeout"
 
-    while (time.time() - start_time) < CONNECTION_TIMEOUT:
-        time.sleep(POLL_INTERVAL)
-        
-        nm.monitor_connection_status()
-        current_state = nm.wifi_state
-        ip_address = nm.get_ip_address()
-        
-        popup_handler(f"State: {current_state}, IP: {ip_address}", level=1)
-
-        # Явный провал авторизации
-        if current_state == enums.DeviceState.FAILED:
-            error_message = "Authentication failed (wrong password)"
-            popup_handler("Состояние FAILED - неверный пароль", level=2)
-            break
-        
-        # Успешное подключение
-        if current_state == enums.DeviceState.ACTIVATED:
-            if ip_address and ip_address != "0.0.0.0" and not ip_address.startswith("169.254"):
-                success_count += 1
-                popup_handler(f"Успешная проверка {success_count}/{STABLE_SUCCESS_COUNT}", level=1)
-                
-                if success_count >= STABLE_SUCCESS_COUNT:
-                    final_status = "connected"
-                    popup_handler(f"Подключение подтверждено (IP: {ip_address})", level=0)
-                    break
-            else:
-                popup_handler("ACTIVATED но IP не получен, ждем...", level=1)
-                success_count = 0
-        else:
-            if success_count > 0:
-                error_message = "Connection lost during authentication"
-                popup_handler("Соединение разорвано в процессе авторизации", level=2)
-            success_count = 0
-
-    # 4. Обработка результата
-    if final_status == "connected":
-        return make_json_response({
-            "status": "connected", 
-            "ssid": ssid,
-            "message": "Password valid and connected",
-            "ip_address": nm.get_ip_address()
-        })
-    else:
-        # Если сеть была НОВАЯ и не подключилась — удаляем профиль
-        # Если сеть была ИЗВЕСТНАЯ — оставляем профиль (вдруг просто глюк сети)
-        if not is_known:
-            try:
-                nm.delete_network(ssid)
-                popup_handler(f"Профиль {ssid} удален после неудачи", level=1)
-            except:
-                pass
-            
-        return make_json_response({
-            "status": "failed", 
-            "ssid": ssid,
-            "error": error_message
-        }, status=401)
-
-@app.route("/wifi/disconnect", methods=["POST"])
+@app.post("/wifi/disconnect")
 def disconnect_network():
-    nm = SdbusNm(popup_handler)
+    nm = network_manager()
+    if error := wifi_device_required(nm):
+        return error
     nm.disconnect_network()
-    return make_json_response({"status": "disconnected"})
+    return jsonify(status="disconnected")
 
 
-@app.route("/wifi/network/<ssid>", methods=["DELETE"])
+@app.delete("/wifi/network/<path:ssid>")
 def delete_network(ssid):
-    nm = SdbusNm(popup_handler)
-    nm.delete_network(ssid)
-    return make_json_response({"status": "deleted", "ssid": ssid})
+    network_manager().delete_network(ssid)
+    return jsonify(status="deleted", ssid=ssid)
 
 
-@app.route("/wifi/toggle", methods=["POST"])
+@app.post("/wifi/toggle")
 def toggle_wifi():
-    nm = SdbusNm(popup_handler)
-    data = request.json
-    enable = data.get("enable", True)
-    nm.toggle_wifi(enable)
-    return make_json_response({"wifi_enabled": nm.is_wifi_enabled()})
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not isinstance(data.get("enable"), bool):
+        return jsonify(error="Expected a boolean enable field"), 400
+    nm = network_manager()
+    if error := wifi_device_required(nm):
+        return error
+    nm.toggle_wifi(data["enable"])
+    return jsonify(wifi_enabled=nm.is_wifi_enabled())
 
-@app.route("/wifi/rescan", methods=["POST"])
+
+@app.post("/wifi/rescan")
 def rescan_networks():
-    nm = SdbusNm(popup_handler)
-    try:
-        popup_handler("Запуск сканирования Wi-Fi...", level=1)
-        nm.rescan()
-        return make_json_response({"status": "scan_started"})
-    except Exception as e:
-        popup_handler(f"Ошибка сканирования: {e}", level=2)
-        return make_json_response({"status": "error", "message": str(e)}, status=500)
+    nm = network_manager()
+    if error := wifi_device_required(nm):
+        return error
 
-@app.route("/wifi/monitor", methods=["POST"])
+    previous_scan = nm.wlan_device.last_scan
+    nm.rescan()
+    deadline = time.monotonic() + 4
+    while time.monotonic() < deadline:
+        if nm.wlan_device.last_scan != previous_scan:
+            return jsonify(status="scan_completed")
+        time.sleep(POLL_INTERVAL)
+    return jsonify(status="scan_started"), 202
+
+
+@app.post("/wifi/monitor")
 def toggle_monitoring():
-    data = request.json
-    enable = data.get("enable", True)
-    nm = SdbusNm(popup_handler)
-    nm.enable_monitoring(enable)
-    return make_json_response({"monitoring": enable})
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not isinstance(data.get("enable"), bool):
+        return jsonify(error="Expected a boolean enable field"), 400
+    app.config["WIFI_MONITORING"] = data["enable"]
+    return jsonify(monitoring=data["enable"])
 
-@app.route("/wifi/monitor/status", methods=["GET"])
+
+@app.get("/wifi/monitor/status")
 def monitor_status():
-    nm = SdbusNm(popup_handler)
+    nm = network_manager()
     nm.monitor_connection_status()
-    
-    state_map = {
-        enums.DeviceState.UNKNOWN: "UNKNOWN",
-        enums.DeviceState.UNMANAGED: "UNMANAGED",
-        enums.DeviceState.UNAVAILABLE: "UNAVAILABLE",
-        enums.DeviceState.DISCONNECTED: "DISCONNECTED",
-        enums.DeviceState.PREPARE: "PREPARE",
-        enums.DeviceState.CONFIG: "CONFIG",
-        enums.DeviceState.IP_CONFIG: "IP_CONFIG",
-        enums.DeviceState.IP_CHECK: "IP_CHECK",
-        enums.DeviceState.SECONDARIES: "SECONDARIES",
-        enums.DeviceState.ACTIVATED: "ACTIVATED",
-        enums.DeviceState.DEACTIVATING: "DEACTIVATING",
-        enums.DeviceState.FAILED: "FAILED",
-    }
-    return make_json_response({
-        "wifi_state": state_map.get(nm.wifi_state, "UNKNOWN"),
-        "monitoring": nm.monitor_connection,
-    })
-
-
+    return jsonify(
+        wifi_state=getattr(nm.wifi_state, "name", "UNKNOWN"),
+        monitoring=app.config.get("WIFI_MONITORING", False),
+    )

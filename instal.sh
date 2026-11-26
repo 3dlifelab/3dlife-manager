@@ -1,4 +1,5 @@
 #!/bin/bash
+set -Eeuo pipefail
 
 # ============================================================================
 # Скрипт установки Flask + Vue.js приложения на Raspberry Pi
@@ -39,13 +40,11 @@ SYSTEMD_SERVICE_FILE="./service/wifi-manager.service"
 BACKEND_SOURCE_DIR="./backend"
 
 # Путь к dist/ папке фронтенда (собранной через npm run build)
-FRONTEND_DIST_PATH="./dist"
+FRONTEND_DIST_PATH="./frontend/dist"
 
 # Путь к вашему готовому nginx-конфигу
 YOUR_NGINX_CONFIG="./service/3dlife-manager"
 CONFIG_FILENAME="3dlife-manager"
-# Репозиторий с фронтендом (в формате owner/repo)
-FRONTEND_REPO="3dlifelab/3dlife-manager-frontend"
 
 # Имя вашего Flask-приложения (файл:переменная)
 FLASK_APP="app:app"
@@ -60,6 +59,20 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
+for required_file in "$BACKEND_SOURCE_DIR/requirements.txt" "$SYSTEMD_SERVICE_FILE" \
+    "$YOUR_NGINX_CONFIG" "$FRONTEND_DIST_PATH/index.html"; do
+    if [ ! -f "$required_file" ]; then
+        log_error "Файл не найден: $required_file"
+        log_error "Сборка фронтенда: cd frontend && npm ci && npm run build"
+        exit 1
+    fi
+done
+
+if ! systemctl is-active --quiet NetworkManager.service; then
+    log_error "Для менеджера Wi-Fi требуется запущенный NetworkManager"
+    exit 1
+fi
 log_info "Начинаем установку..."
 
 # ============================================================================
@@ -69,13 +82,12 @@ log_info "Начинаем установку..."
 log_info "Шаг 1: Установка системных пакетов..."
 
 apt update
-apt upgrade -y
 
 # Базовые утилиты
-apt install -y git curl wget build-essential
+apt install -y build-essential pkg-config libsystemd-dev iproute2
 
 # Python и venv
-apt install -y python3 python3-pip python3-venv
+apt install -y python3 python3-pip python3-venv python3-dev
 
 # Nginx
 apt install -y nginx
@@ -99,9 +111,6 @@ else
     log_info "Пользователь $APP_USER создан"
 fi
 
-# Добавляем в группу netdev для доступа к NetworkManager через polkit
-usermod -aG netdev "$APP_USER"
-log_info "Пользователь $APP_USER добавлен в группу netdev"
 
 # ============================================================================
 # ШАГ 4: Создание директорий
@@ -110,12 +119,9 @@ log_info "Пользователь $APP_USER добавлен в группу ne
 log_info "Шаг 3: Создание директорий..."
 
 mkdir -p "$BACKEND_DIR"
-mkdir -p "$FRONTEND_DIR"
 mkdir -p "$(dirname "$VENV_DIR")"
 
 chown -R "$APP_USER:$APP_USER" "$BACKEND_DIR"
-chown -R www-data:www-data "$FRONTEND_DIR"
-chmod -R 755 "$FRONTEND_DIR"
 
 log_info "Директории созданы"
 
@@ -127,9 +133,9 @@ log_info "Шаг 4: Настройка Polkit для NetworkManager..."
 
 POLKIT_RULE_FILE="/etc/polkit-1/rules.d/50-nm-network.rules"
 
-cat > "$POLKIT_RULE_FILE" << 'EOF'
+cat > "$POLKIT_RULE_FILE" << EOF
 polkit.addRule(function(action, subject) {
-    if (action.id.indexOf("org.freedesktop.NetworkManager.") === 0 && subject.isInGroup("netdev")) {
+    if (action.id.indexOf("org.freedesktop.NetworkManager.") === 0 && subject.user === "$APP_USER") {
         return polkit.Result.YES;
     }
 });
@@ -170,15 +176,15 @@ log_info "Код скопирован"
 
 # Создаем виртуальное окружение от имени пользователя приложения
 log_info "Создание виртуального окружения..."
-sudo -u "$APP_USER" python3 -m venv "$VENV_DIR"
+runuser -u "$APP_USER" -- python3 -m venv "$VENV_DIR"
 
 # Обновляем pip
 log_info "Обновление pip..."
-sudo -u "$APP_USER" "$VENV_DIR/bin/pip" install --upgrade pip
+runuser -u "$APP_USER" -- "$VENV_DIR/bin/pip" install --upgrade pip
 
 # Устанавливаем зависимости
 log_info "Установка зависимостей Python..."
-sudo -u "$APP_USER" "$VENV_DIR/bin/pip" install -r "$BACKEND_DIR/requirements.txt"
+runuser -u "$APP_USER" -- "$VENV_DIR/bin/pip" install -r "$BACKEND_DIR/requirements.txt"
 
 
 log_info "Backend установлен"
@@ -204,7 +210,7 @@ systemctl daemon-reload
 
 # Включаем автозагрузку и запускаем сервис
 systemctl enable wifi-manager
-systemctl start wifi-manager
+systemctl restart wifi-manager
 
 # Небольшая пауза, чтобы сервис успел инициализироваться перед проверкой
 sleep 2
@@ -223,126 +229,34 @@ fi
 
 log_info "Шаг 7: Установка Frontend..."
 
-# Проверяем, что указан репозиторий с фронтендом
-if [ -z "$FRONTEND_REPO" ]; then
-    log_error "Переменная FRONTEND_REPO не установлена!"
-    log_error "Укажите репозиторий в формате 'owner/repo' в начале скрипта"
+# Подготавливаем новую версию до замены действующего каталога.
+TEMP_DIR=$(mktemp -d /var/www/.3dlife-manager.XXXXXX)
+trap 'rm -rf -- "$TEMP_DIR"' EXIT
+mkdir "$TEMP_DIR/dist"
+cp -a -- "$FRONTEND_DIST_PATH/." "$TEMP_DIR/dist/"
+chown -R root:root "$TEMP_DIR/dist"
+chmod -R u=rwX,go=rX "$TEMP_DIR/dist"
+
+BACKUP_DIR=""
+if [ -d "$FRONTEND_DIR" ]; then
+    BACKUP_DIR=$(mktemp -d /var/www/.3dlife-manager-backup.XXXXXX)
+    mv -- "$FRONTEND_DIR" "$BACKUP_DIR/dist"
+fi
+if ! mv -T -- "$TEMP_DIR/dist" "$FRONTEND_DIR"; then
+    if [ -n "$BACKUP_DIR" ]; then
+        mv -T -- "$BACKUP_DIR/dist" "$FRONTEND_DIR"
+    fi
     exit 1
 fi
-
-# Получаем информацию о последнем release
-log_info "Получение информации о последнем release из $FRONTEND_REPO..."
-
-RELEASE_INFO=$(curl -s "https://api.github.com/repos/$FRONTEND_REPO/releases/latest")
-
-# Проверяем, что release существует
-if echo "$RELEASE_INFO" | grep -q '"message": "Not Found"'; then
-    log_error "Не удалось найти releases в репозитории $FRONTEND_REPO"
-    log_error "Убедитесь, что репозиторий публичный или настроен токен GitHub"
-    exit 1
+if [ -n "$BACKUP_DIR" ]; then
+    log_info "Резервная копия: $BACKUP_DIR/dist"
 fi
-
-# Получаем URL для скачивания ZIP-архива (ищем asset с расширением .zip)
-DOWNLOAD_URL=$(echo "$RELEASE_INFO" | grep "browser_download_url.*\.zip" | head -1 | cut -d '"' -f 4)
-
-if [ -z "$DOWNLOAD_URL" ]; then
-    log_error "Не найден ZIP-архив в последнем release!"
-    log_error "Убедитесь, что в release загружен файл с расширением .zip"
-    exit 1
-fi
-
-# Получаем версию release
-VERSION=$(echo "$RELEASE_INFO" | grep '"tag_name"' | head -1 | cut -d '"' -f 4)
-log_info "Найден release: $VERSION"
-
-# Создаем временную директорию для скачивания
-TEMP_DIR=$(mktemp -d)
-ARCHIVE_FILE="$TEMP_DIR/frontend.zip"
-
-# Скачиваем архив
-log_info "Скачивание архива..."
-if ! curl -L -o "$ARCHIVE_FILE" "$DOWNLOAD_URL"; then
-    log_error "Не удалось скачать архив!"
-    rm -rf "$TEMP_DIR"
-    exit 1
-fi
-
-# Проверяем размер архива
-ARCHIVE_SIZE=$(du -h "$ARCHIVE_FILE" | cut -f1)
-log_info "Архив скачан: $ARCHIVE_SIZE"
-
-# Создаем временную папку для распаковки
-EXTRACT_DIR="$TEMP_DIR/extracted"
-mkdir -p "$EXTRACT_DIR"
-
-# Распаковываем архив
-log_info "Распаковка архива..."
-if ! unzip -q "$ARCHIVE_FILE" -d "$EXTRACT_DIR"; then
-    log_error "Не удалось распаковать архив!"
-    rm -rf "$TEMP_DIR"
-    exit 1
-fi
-
-# Проверяем структуру: если внутри есть одна папка, заходим в неё
-# (GitHub иногда упаковывает в подпапку)
-if [ $(find "$EXTRACT_DIR" -mindepth 1 -maxdepth 1 -type d | wc -l) -eq 1 ] && \
-   [ $(find "$EXTRACT_DIR" -mindepth 1 -maxdepth 1 | wc -l) -eq 1 ]; then
-    # Есть только одна папка на верхнем уровне
-    INNER_DIR=$(find "$EXTRACT_DIR" -mindepth 1 -maxdepth 1 -type d)
-    log_info "Обнаружена вложенная папка: $(basename $INNER_DIR)"
-    EXTRACT_DIR="$INNER_DIR"
-fi
-
-# Проверяем, что есть index.html
-if [ ! -f "$EXTRACT_DIR/index.html" ]; then
-    log_error "В архиве не найден index.html!"
-    log_error "Проверьте структуру релиза в репозитории $FRONTEND_REPO"
-    rm -rf "$TEMP_DIR"
-    exit 1
-fi
-
-# ============================================================================
-# БЕКАП СТАРОЙ ВЕРСИИ (опционально)
-# ============================================================================
-
-if [ -d "$FRONTEND_DIR" ] && [ "$(ls -A $FRONTEND_DIR 2>/dev/null)" ]; then
-    BACKUP_DIR="/var/www/3dlife-manager/frontend-backup-$(date +%Y%m%d-%H%M%S)"
-    log_info "Создание бэкапа старой версии в $BACKUP_DIR..."
-    cp -r "$FRONTEND_DIR" "$BACKUP_DIR"
-    log_info "Бэкап создан"
-fi
-
-# ============================================================================
-# УСТАНОВКА НОВОЙ ВЕРСИИ
-# ============================================================================
-
-log_info "Установка новой версии..."
-
-# Очищаем старую директорию
-rm -rf "$FRONTEND_DIR"
-mkdir -p "$FRONTEND_DIR"
-
-# Копируем новые файлы
-cp -r "$EXTRACT_DIR"/* "$FRONTEND_DIR/"
-
-# Устанавливаем правильные права
-chown -R www-data:www-data "$FRONTEND_DIR"
-chmod -R 755 "$FRONTEND_DIR"
-
-# ============================================================================
-# ОЧИСТКА
-# ============================================================================
-
-log_info "Очистка временных файлов..."
-rm -rf "$TEMP_DIR"
-
-log_info "Frontend установлен (версия: $VERSION)"
 
 # ============================================================================
 # ШАГ 9: Настройка Nginx (используем ваш готовый конфиг)
 # ============================================================================
 
-og_info "Шаг 8: Настройка Nginx..."
+log_info "Шаг 8: Настройка Nginx..."
 
 # Имя вашего файла конфигурации (убедитесь, что он заканчивается на .conf)
 # Если ваш файл называется просто "3dlife-manager", переименуйте его в "3dlife-manager.conf"
@@ -366,11 +280,6 @@ cp "$YOUR_NGINX_CONFIG" "$NGINX_AVAILABLE"
 # 3. Создаем СИМВОЛИЧЕСКУЮ ССЫЛКУ на КОНКРЕТНЫЙ ФАЙЛ (не на папку!)
 log_info "Активация конфигурации..."
 ln -sf "$NGINX_AVAILABLE" "$NGINX_ENABLED"
-
-# 4. Удаляем стандартный конфиг nginx, чтобы он не перехватывал порт 80
-rm -f /etc/nginx/sites-enabled/default
-# Также удалим ту самую ошибочную ссылку на папку, если она вдруг создалась
-rm -f /etc/nginx/sites-enabled/sites-available
 
 # 5. Проверяем синтаксис Nginx
 log_info "Проверка синтаксиса Nginx..."
@@ -403,6 +312,7 @@ if systemctl is-active --quiet wifi-manager; then
 else
     log_error "Backend (wifi-manager): НЕ РАБОТАЕТ"
     log_error "Проверьте логи: journalctl -u wifi-manager -n 50"
+    exit 1
 fi
 
 # Проверяем nginx
@@ -411,6 +321,7 @@ if systemctl is-active --quiet nginx; then
 else
     log_error "Nginx: НЕ РАБОТАЕТ"
     log_error "Проверьте логи: journalctl -u nginx -n 50"
+    exit 1
 fi
 
 
@@ -422,7 +333,7 @@ echo ""
 echo "1. IP адрес Raspberry Pi:"
 hostname -I | awk '{print $1}'
 echo ""
-echo "2. Откройте в браузере: http://$(hostname -I | awk '{print $1}')"
+echo "2. Откройте в браузере: http://$(hostname -I | awk '{print $1}'):3000"
 echo ""
 echo "3. Логи Backend:"
 echo "   sudo journalctl -u wifi-manager -f"

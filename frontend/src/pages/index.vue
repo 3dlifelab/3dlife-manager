@@ -1,7 +1,7 @@
 <template>
-  <HelloWorld />
+  <WifiManager />
 </template>
 
-<script lang="ts" setup>
-  //
+<script setup lang="ts">
+import WifiManager from '@/components/WifiManager.vue'
 </script>

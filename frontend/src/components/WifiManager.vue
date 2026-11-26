@@ -1,210 +1,185 @@
 <template>
-  <v-app>
-    <v-app-bar color="primary" dark>
-      <v-app-bar-title>Wi-Fi Manager</v-app-bar-title>
-      <v-spacer></v-spacer>
-      <title>test</title>
-      <v-btn icon @click="refreshNetworks">
-        <v-icon>mdi-refresh</v-icon>
+  <v-container>
+    <div class="d-flex flex-wrap align-center justify-space-between ga-3 mb-4">
+      <div>
+        <h1 class="text-h5">Wi-Fi менеджер</h1>
+        <p v-if="status?.active_connection">
+          {{ status.active_connection.name }} {{ status.active_connection.ip }}
+        </p>
+      </div>
+      <v-btn :loading="busy" :disabled="busy || status?.wifi.enabled === false" @click="refresh(true)">
+        Сканировать
       </v-btn>
-    </v-app-bar>
+    </div>
 
-    <v-main class="pa-6">
-      <v-card elevation="2" rounded="lg">
-        <v-card-title>
-          Доступные Wi-Fi сети
-          <v-spacer></v-spacer>
+    <v-alert v-if="error" class="mb-4" type="error">{{ error }}</v-alert>
+    <v-alert v-if="notice" class="mb-4" type="info">{{ notice }}</v-alert>
+    <v-alert v-else-if="status?.wifi.enabled === false" class="mb-4" type="info">
+      Wi-Fi выключен
+    </v-alert>
+    <v-text-field v-model="search" label="Поиск сети" prepend-inner-icon="mdi-magnify" />
+
+    <v-data-table
+      :headers="headers"
+      :items="networks"
+      :loading="busy"
+      :search="search"
+      item-value="BSSID"
+      no-data-text="Сети не найдены"
+    >
+      <template #item.signal_level="{ item }">{{ item.signal_level }}%</template>
+      <template #item.actions="{ item }">
+        <v-btn size="small" variant="text" :disabled="busy" @click="selectNetwork(item)">
+          {{ isConnected(item) ? 'Отключиться' : 'Подключиться' }}
+        </v-btn>
+      </template>
+    </v-data-table>
+
+    <v-dialog v-model="dialog" :persistent="busy" max-width="460">
+      <v-card v-if="selected" :title="selected.SSID">
+        <v-card-text v-if="requiresPassword || actionError">
+          <v-alert v-if="actionError" class="mb-3" type="error">{{ actionError }}</v-alert>
           <v-text-field
-            v-model="search"
-            append-icon="mdi-magnify"
-            label="Поиск"
-            single-line
-            hide-details
-            density="compact"
-            style="max-width: 300px"
-          ></v-text-field>
-        </v-card-title>
-
-        <v-data-table-server
-          :items="networks"
-          :headers="headers"
-          :items-length="totalNetworks"
-          :loading="loading"
-          :search="search"
-          item-value="ssid"
-        >
-          <template v-slot:item.strength="{ item }">
-            <v-rating
-              :model-value="getSignalStrength(item.raw.strength)"
-              readonly
-              half-increments
-              size="small"
-              density="compact"
-              background-color="amber lighten-3"
-              color="amber"
-            ></v-rating>
-          </template>
-
-          <template v-slot:item.secured="{ item }">
-            <v-chip
-              :color="item.raw.secured ? 'warning' : 'success'"
-              size="small"
-              variant="outlined"
-            >
-              {{ item.raw.secured ? 'Защищена' : 'Открыта' }}
-            </v-chip>
-          </template>
-
-          <template v-slot:item.actions="{ item }">
-            <v-btn
-              size="small"
-              color="primary"
-              variant="text"
-              @click="openConnectDialog(item.raw)"
-            >
-              {{ item.raw.connected ? 'Отключиться' : 'Подключиться' }}
-            </v-btn>
-          </template>
-        </v-data-table-server>
-      </v-card>
-    </v-main>
-
-    <!-- Диалог подключения -->
-    <v-dialog v-model="dialog" max-width="500px">
-      <v-card>
-        <v-card-title class="text-h6">
-          {{ currentNetwork.connected ? 'Отключиться от сети' : 'Подключиться к сети' }}
-        </v-card-title>
-
-        <v-card-text class="pt-4">
-          <div v-if="!currentNetwork.connected && currentNetwork.secured">
-            <p>Введите пароль для сети <strong>{{ currentNetwork.ssid }}</strong></p>
-            <v-text-field
-              v-model="password"
-              label="Пароль"
-              type="password"
-              variant="outlined"
-              hide-details
-            ></v-text-field>
-          </div>
-
-          <div v-else>
-            Вы уверены, что хотите {{ currentNetwork.connected ? 'отключиться от' : 'подключиться к' }} сети <strong>{{ currentNetwork.ssid }}</strong>?
-          </div>
+            v-if="requiresPassword"
+            v-model="password"
+            :disabled="busy"
+            label="Пароль Wi-Fi"
+            type="password"
+            @keyup.enter="confirmAction"
+          />
         </v-card-text>
-
         <v-card-actions>
-          <v-spacer></v-spacer>
-          <v-btn color="secondary" variant="text" @click="dialog = false">Отмена</v-btn>
-          <v-btn color="primary" @click="confirmAction">Подтвердить</v-btn>
+          <v-spacer />
+          <v-btn :disabled="busy" @click="dialog = false">Отмена</v-btn>
+          <v-btn :disabled="busy || (requiresPassword && !password)" :loading="busy" @click="confirmAction">
+            {{ isConnected(selected) ? 'Отключиться' : 'Подключиться' }}
+          </v-btn>
         </v-card-actions>
       </v-card>
     </v-dialog>
-
-    <!-- Уведомление -->
-    <v-snackbar v-model="snackbar.show" :timeout="3000" :color="snackbar.color">
-      {{ snackbar.message }}
-    </v-snackbar>
-  </v-app>
+  </v-container>
 </template>
 
-<script setup>
-import { ref, reactive } from 'vue';
+<script setup lang="ts">
+import { computed, onMounted, ref, watch } from 'vue'
 
-// === Моковые данные ===
-const generateMockNetworks = () => [
-  { ssid: 'HomeNetwork', strength: 4, secured: true, connected: false },
-  { ssid: 'Guest-WiFi', strength: 3, secured: false, connected: false },
-  { ssid: 'OfficeSecure', strength: 5, secured: true, connected: false },
-  { ssid: 'Starbucks_WiFi', strength: 2, secured: false, connected: false },
-  { ssid: 'MyRouter', strength: 5, secured: true, connected: true },
-  { ssid: 'NeighbourNet', strength: 1, secured: true, connected: false },
-];
-
-// === Состояние ===
-const networks = ref([]);
-const totalNetworks = ref(0);
-const loading = ref(false);
-const search = ref('');
-const dialog = ref(false);
-const password = ref('');
-const snackbar = reactive({
-  show: false,
-  message: '',
-  color: 'success',
-});
-const currentNetwork = ref({});
-
-// === Заголовки таблицы ===
-const headers = [
-  { title: 'SSID', key: 'ssid', sortable: true },
-  { title: 'Сигнал', key: 'strength', sortable: true },
-  { title: 'Статус', key: 'secured', sortable: true },
-  { title: 'Действия', key: 'actions', sortable: false },
-];
-
-// === Методы ===
-const refreshNetworks = () => {
-  loading.value = true;
-  // Имитация задержки загрузки
-  setTimeout(() => {
-    const mockData = generateMockNetworks();
-    networks.value = mockData;
-    totalNetworks.value = mockData.length;
-    loading.value = false;
-  }, 800);
-};
-
-const getSignalStrength = (strength) => {
-  return strength / 5; // преобразуем в 0-1 для рейтинга из 5 звёзд
-};
-
-const openConnectDialog = (network) => {
-  currentNetwork.value = { ...network };
-  password.value = '';
-  dialog.value = true;
-};
-
-const confirmAction = () => {
-  const net = currentNetwork.value;
-
-  if (net.connected) {
-    // Отключение
-    showMessage(`Отключено от ${net.ssid}`, 'info');
-    const index = networks.value.findIndex(n => n.ssid === net.ssid);
-    if (index !== -1) networks.value[index].connected = false;
-  } else if (net.secured && !password.value) {
-    showMessage('Введите пароль!', 'error');
-    return;
-  } else {
-    // Подключение
-    showMessage(`Подключено к ${net.ssid}`, 'success');
-    const index = networks.value.findIndex(n => n.ssid === net.ssid);
-    if (index !== -1) {
-      networks.value[index].connected = true;
-      // Сбрасываем подключения у других
-      networks.value.forEach((n, i) => {
-        if (i !== index) n.connected = false;
-      });
-    }
-  }
-
-  dialog.value = false;
-};
-
-const showMessage = (msg, color = 'success') => {
-  snackbar.message = msg;
-  snackbar.color = color;
-  snackbar.show = true;
-};
-
-// Загрузка при старте
-refreshNetworks();
-</script>
-
-<style scoped>
-.v-app-bar-title {
-  font-size: 1.2rem;
-  font-weight: 500;
+interface WifiNetwork {
+  SSID: string
+  BSSID: string
+  known: boolean
+  security: string
+  signal_level: number
 }
-</style>
+
+interface WifiStatus {
+  wifi: { enabled: boolean, connected: boolean, ssid: string | null }
+  active_connection: { name: string, ip: string | null } | null
+}
+
+const headers = [
+  { title: 'Сеть', key: 'SSID' },
+  { title: 'Сигнал', key: 'signal_level' },
+  { title: 'Защита', key: 'security' },
+  { title: 'Действие', key: 'actions', sortable: false },
+]
+
+const networks = ref<WifiNetwork[]>([])
+const status = ref<WifiStatus>()
+const selected = ref<WifiNetwork>()
+const search = ref('')
+const password = ref('')
+const busy = ref(false)
+const dialog = ref(false)
+const error = ref('')
+const notice = ref('')
+const actionError = ref('')
+const requiresPassword = computed(() => {
+  const network = selected.value
+  return Boolean(network && !network.known && !isConnected(network)
+    && !['Open', 'OWE', 'OWE-TM'].includes(network.security))
+})
+
+watch(dialog, open => {
+  if (!open) password.value = ''
+})
+
+async function api<T>(path: string, options?: RequestInit): Promise<T> {
+  const response = await fetch('/wifi/' + path, options)
+  const data = await response.json().catch(() => null)
+  if (!response.ok || data === null) {
+    throw new Error(data?.message || data?.error || `Ошибка API Wi-Fi (HTTP ${response.status})`)
+  }
+  return data
+}
+
+async function loadNetworks() {
+  const [wifiStatus, scannedNetworks] = await Promise.all([
+    api<WifiStatus>('status'),
+    api<WifiNetwork[]>('networks'),
+  ])
+  status.value = wifiStatus
+  const strongestBySsid = new Map<string, WifiNetwork>()
+  for (const network of scannedNetworks) {
+    if (!strongestBySsid.has(network.SSID)) strongestBySsid.set(network.SSID, network)
+  }
+  networks.value = [...strongestBySsid.values()]
+}
+
+async function refresh(scan = false) {
+  if (busy.value) return
+  busy.value = true
+  error.value = ''
+  notice.value = ''
+  try {
+    if (scan) {
+      const result = await api<{ status: string }>('rescan', { method: 'POST' })
+      if (result.status === 'scan_started') {
+        notice.value = 'Сканирование ещё выполняется. Показаны последние доступные результаты.'
+      }
+    }
+    await loadNetworks()
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : String(cause)
+  } finally {
+    busy.value = false
+  }
+}
+
+function isConnected(network: WifiNetwork) {
+  return status.value?.wifi.connected && status.value.wifi.ssid === network.SSID
+}
+
+function selectNetwork(network: WifiNetwork) {
+  selected.value = network
+  password.value = ''
+  actionError.value = ''
+  dialog.value = true
+}
+
+async function confirmAction() {
+  const network = selected.value
+  if (!network || busy.value || (requiresPassword.value && !password.value)) return
+  busy.value = true
+  actionError.value = ''
+  try {
+    if (isConnected(network)) {
+      await api('disconnect', { method: 'POST' })
+    } else {
+      await api('connect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ssid: network.SSID, password: password.value }),
+      })
+    }
+    dialog.value = false
+    error.value = ''
+  } catch (cause) {
+    actionError.value = cause instanceof Error ? cause.message : String(cause)
+  } finally {
+    busy.value = false
+  }
+  if (!dialog.value) await refresh()
+}
+
+onMounted(() => refresh())
+</script>

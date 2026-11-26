@@ -1,7 +1,7 @@
+import json
 import logging
 import subprocess
 from uuid import uuid4
-import os
 
 import sdbus
 from sdbus_block.networkmanager import (
@@ -64,7 +64,7 @@ def get_encryption(flags):
 
 
 def WifiChannels(freq: str):
-    if freq == "2484":
+    if str(freq) == "2484":
         return "2.4", "14"
     try:
         freq = float(freq)
@@ -78,7 +78,9 @@ def WifiChannels(freq: str):
         return "5", str(int((freq - 4000) / 5))
     elif 5035 <= freq <= 5885:
         return "5", str(int((freq - 5000) / 5))
-    elif 6455 <= freq <= 7115:
+    elif freq == 5935:
+        return "6", "2"
+    elif 5955 <= freq <= 7115:
         return "6", str(int((freq - 5950) / 5))
     else:
         return "?", "?"
@@ -93,36 +95,16 @@ class SdbusNm:
         # Инициализация D-Bus
         self.system_bus = sdbus.sd_bus_open_system()
         if self.system_bus is None:
-            return
-        
+            raise RuntimeError("Системная шина D-Bus недоступна")
+
         sdbus.set_default_bus(self.system_bus)
         
-        # Создание объекта NetworkManager
-        self.nm = NetworkManager()
-        
-        # ✅ Проверка ПОСЛЕ создания объекта
-        if not self.ensure_nm_running():
-            raise RuntimeError("NetworkManager не отвечает")
-        
-        # Остальная инициализация
-        self.wlan_device = (
-            self.get_wireless_interfaces()[0]
-            if self.get_wireless_interfaces()
-            else None
-        )
+        self.nm = NetworkManager(bus=self.system_bus)
+        wireless_interfaces = self.get_wireless_interfaces()
+        self.wlan_device = wireless_interfaces[0] if wireless_interfaces else None
         self.wifi = self.wlan_device is not None
         self.monitor_connection = False
         self.wifi_state = -1
-
-    def ensure_nm_running(self):
-        """Проверяет доступность NetworkManager через D-Bus"""
-        try:
-            # Пытаемся получить список устройств — если NM не работает, тут будет ошибка
-            _ = self.nm.get_devices()
-            return True
-        except Exception as e:
-            self.popup(f"NetworkManager недоступен: {e}", 2)
-            return False
 
     def is_wifi_enabled(self):
         return self.nm.wireless_enabled
@@ -161,7 +143,7 @@ class SdbusNm:
             if con_settings["connection"]["type"][1] == "802-11-wireless":
                 known_networks.append(
                     {
-                        "SSID": con_settings["802-11-wireless"]["ssid"][1].decode(),
+                        "SSID": con_settings["802-11-wireless"]["ssid"][1].decode(errors="surrogateescape"),
                         "UUID": con_settings["connection"]["uuid"][1],
                     }
                 )
@@ -170,39 +152,48 @@ class SdbusNm:
     def is_known(self, ssid):
         return any(net["SSID"] == ssid for net in self.get_known_networks())
 
-    def get_ip_address(self):
-        active_connection_path = self.nm.primary_connection
-        if not active_connection_path or active_connection_path == "/":
-            return "?"
-        active_connection = ActiveConnection(active_connection_path)
-        ip_info = IPv4Config(active_connection.ip4_config)
-        return ip_info.address_data[0]["address"][1]
+    def get_ip_address(self, active_path=None):
+        if not self.wlan_device:
+            return None
+        device_connection = self.wlan_device.active_connection
+        if device_connection == "/" or (active_path and device_connection != active_path):
+            return None
+        config_path = ActiveConnection(device_connection).ip4_config
+        if config_path == "/":
+            return None
+        addresses = IPv4Config(config_path).address_data
+        return addresses[0]["address"][1] if addresses else None
 
     def get_networks(self):
+        if not self.wlan_device:
+            return []
+        known_ssids = {network["SSID"] for network in self.get_known_networks()}
         networks = []
-        if self.wlan_device:
-            all_aps = [AccessPoint(result) for result in self.wlan_device.access_points]
-            networks.extend(
-                {
-                    "SSID": ap.ssid.decode("utf-8"),
-                    "known": self.is_known(ap.ssid.decode("utf-8")),
-                    "security": get_encryption(
-                        ap.rsn_flags or ap.wpa_flags or ap.flags
-                    ),
-                    "frequency": WifiChannels(ap.frequency)[0],
-                    "signal_level": ap.strength,
-                    "BSSID": ap.hw_address,
-                }
-                for ap in all_aps
-                if ap.ssid
-            )
-            return sorted(networks, key=lambda i: i["signal_level"], reverse=True)
-        return networks
+        for path in self.wlan_device.access_points:
+            ap = AccessPoint(path)
+            ssid = ap.ssid.decode("utf-8", errors="surrogateescape")
+            if not ssid:
+                continue
+            flags = ap.rsn_flags | ap.wpa_flags
+            security = get_encryption(flags) or "Unknown"
+            if not flags and ap.flags & 1:
+                security = "WEP"
+            networks.append({
+                "SSID": ssid,
+                "known": ssid in known_ssids,
+                "security": security,
+                "frequency": WifiChannels(ap.frequency)[0],
+                "signal_level": ap.strength,
+                "BSSID": ap.hw_address,
+            })
+        return sorted(networks, key=lambda network: network["signal_level"], reverse=True)
 
     def get_bssid_from_ssid(self, ssid):
         return next(net["BSSID"] for net in self.get_networks() if ssid == net["SSID"])
 
     def get_connected_ap(self):
+        if not self.wlan_device:
+            return None
         if self.wlan_device.active_access_point == "/":
             return None
         return AccessPoint(self.wlan_device.active_access_point)
@@ -230,9 +221,6 @@ class SdbusNm:
         if security_type is None:
             return {"error": "network_not_found", "message": "Network not found"}
 
-        if self.is_known(ssid):
-            self.delete_network(ssid)
-
         properties: NetworkManagerConnectionProperties = {
             "connection": {
                 "id": ("s", ssid),
@@ -242,18 +230,18 @@ class SdbusNm:
             },
             "802-11-wireless": {
                 "mode": ("s", "infrastructure"),
-                "ssid": ("ay", ssid.encode("utf-8")),
-                "security": ("s", "802-11-wireless-security"),
+                "ssid": ("ay", ssid.encode("utf-8", errors="surrogateescape")),
             },
             "ipv4": {"method": ("s", "auto")},
             "ipv6": {"method": ("s", "auto")},
         }
 
+        if security_type not in ("Open", "OWE", "OWE-TM") and not psk:
+            return {"error": "Password required for new network"}
+
         if security_type == "Open":
-            properties["802-11-wireless-security"] = {
-                "key-mgmt": ("s", "none"),
-            }
-        elif "WPA-PSK" in security_type:
+            return self.save_network(properties)
+        if "WPA-PSK" in security_type:
             properties["802-11-wireless-security"] = {
                 "key-mgmt": ("s", "wpa-psk"),
                 "psk": ("s", psk),
@@ -264,26 +252,23 @@ class SdbusNm:
                 "psk": ("s", psk),
             }
         elif "WPA3-B192" in security_type:
-            properties["802-11-wireless-security"] = {
-                "key-mgmt": ("s", "wpa-eap-suite-b-192"),
-                "psk": ("s", psk),
-            }
+            return {"error": "WPA3 Enterprise Suite-B requires certificate configuration"}
         elif "OWE" in security_type:
             properties["802-11-wireless-security"] = {
                 "key-mgmt": ("s", "owe"),
             }
         elif "802.1x" in security_type:
-            properties["802-11-wireless-security"] = {
-                "key-mgmt": ("s", "wpa-eap"),
+            if not eap_method or not identity:
+                return {"error": "EAP method and identity are required"}
+            properties["802-11-wireless-security"] = {"key-mgmt": ("s", "wpa-eap")}
+            properties["802-1x"] = {
                 "eap": ("as", [eap_method]),
                 "identity": ("s", identity),
-                "password": ("s", psk.encode("utf-8")),
+                "password": ("s", psk),
             }
             if phase2:
-                if eap_method == "ttls":
-                    properties["802-11-wireless-security"]["phase2_autheap"] = ("s", phase2)
-                else:
-                    properties["802-11-wireless-security"]["phase2_auth"] = ("s", phase2)
+                key = "phase2-autheap" if eap_method == "ttls" else "phase2-auth"
+                properties["802-1x"][key] = ("s", phase2)
         elif "WEP" in security_type:
             properties["802-11-wireless-security"] = {
                 "key-mgmt": ("s", "none"),
@@ -297,9 +282,13 @@ class SdbusNm:
                 "message": "Unknown security type",
             }
 
+        return self.save_network(properties)
+
+    @staticmethod
+    def save_network(properties):
         try:
-            NetworkManagerSettings().add_connection(properties)
-            return {"status": "success"}
+            path = NetworkManagerSettings().add_connection(properties)
+            return {"path": path}
         except exceptions.NmSettingsPermissionDeniedError:
             logging.exception("Insufficient privileges")
             return {
@@ -309,9 +298,9 @@ class SdbusNm:
         except exceptions.NmConnectionInvalidPropertyError:
             logging.exception("Invalid property")
             return {"error": "psk_invalid", "message": "Invalid password"}
-        except Exception as e:
+        except Exception:
             logging.exception("Couldn't add network")
-            return {"error": "unknown", "message": "Couldn't add network" + f"\n{e}"}
+            raise
 
     def disconnect_network(self):
         self.wlan_device.disconnect()
@@ -319,25 +308,12 @@ class SdbusNm:
     def delete_network(self, ssid):
         if path := self.get_connection_path_by_ssid(ssid):
             self.delete_connection_path(path)
-        else:
-            logging.debug(f"SSID '{ssid}' not found among saved connections")
 
     def delete_connection_path(self, path):
-        try:
-            NetworkConnectionSettings(path).delete()
-            logging.info(f"Deleted connection path: {path}")
-        except Exception as e:
-            logging.exception(f"Failed to delete connection path: {path} - {e}")
-            return {
-                "error": "deletion_failed",
-                "message": "Failed to delete connection" + f"\n{e}",
-            }
+        NetworkConnectionSettings(path).delete()
 
     def rescan(self):
-        try:
-            return self.wlan_device.request_scan({})
-        except Exception as e:
-            self.popup(f"Unexpected error: {e}")
+        self.wlan_device.request_scan({})
 
     def get_connection_path_by_ssid(self, ssid):
         existing_networks = NetworkManagerSettings().list_connections()
@@ -348,101 +324,57 @@ class SdbusNm:
             if (
                 connection_settings.get("802-11-wireless")
                 and connection_settings["802-11-wireless"].get("ssid")
-                and connection_settings["802-11-wireless"]["ssid"][1].decode() == ssid
+                and connection_settings["802-11-wireless"]["ssid"][1].decode(errors="surrogateescape") == ssid
             ):
                 return connection_path
         return None
 
-    def connect(self, ssid):
-        if target_connection := self.get_connection_path_by_ssid(ssid):
-            self.popup(f"{ssid}\n{'Starting WiFi Association'}", 1)
-            try:
-                active_connection = self.nm.activate_connection(target_connection)
-                return target_connection
-            except Exception as e:
-                logging.exception("Unexpected error")
-                self.popup(f"Unexpected error: {e}")
-        else:
-            self.popup(f"SSID '{ssid}' not found among saved connections")
+    def connect(self, connection_path):
+        device_path = self.nm.get_device_by_ip_iface(self.wlan_device.interface)
+        return self.nm.activate_connection(connection_path, device_path)
 
     def toggle_wifi(self, enable):
         self.nm.wireless_enabled = enable
 
     def get_ethernet_status(self):
-        import subprocess
-        import re
-        
         try:
-            # 1. Получаем список Ethernet интерфейсов через ip command
             result = subprocess.run(
-                ['/usr/bin/ip', '-o', 'link', 'show'],
-                capture_output=True, text=True, timeout=5
+                ["/usr/bin/ip", "-j", "-4", "address", "show"],
+                capture_output=True, text=True, timeout=3, check=True,
             )
-            
-            ethernet_interfaces = []
-            for line in result.stdout.split('\n'):
-                if line.strip():
-                    parts = line.split(': ')
-                    if len(parts) >= 2:
-                        iface_name = parts[1].split('@')[0]
-                        # Пропускаем loopback и виртуальные интерфейсы
-                        if iface_name not in ['lo', 'docker0', 'br-'] and \
-                        (iface_name.startswith('eth') or iface_name.startswith('end')):
-                            ethernet_interfaces.append(iface_name)
-            
-            self.popup(f"Найдено Ethernet интерфейсов: {ethernet_interfaces}", 1)
-            
-            if not ethernet_interfaces:
-                return {"connected": False, "ip_address": None, "state": 0, "interface": None}
-            
-            # 2. Проверяем каждый интерфейс
-            for iface in ethernet_interfaces:
-                # Проверка наличия линка (кабель подключен)
-                try:
-                    with open(f'/sys/class/net/{iface}/carrier', 'r') as f:
-                        carrier = f.read().strip()
-                    link_up = carrier == '1'
-                except:
-                    link_up = False
-                
-                # Получаем IP адрес
-                ip_address = None
-                if link_up:
-                    result = subprocess.run(
-                        ['/usr/bin/ip', '-4', 'addr', 'show', iface],
-                        capture_output=True, text=True, timeout=5
-                    )
-                    match = re.search(r'inet (\d+\.\d+\.\d+\.\d+)', result.stdout)
-                    if match:
-                        ip_address = match.group(1)
-                
-                self.popup(f"Ethernet {iface}: link={link_up}, ip={ip_address}", 1)
-                
-                # Если есть IP — считаем подключенным
-                if link_up and ip_address:
+            interfaces = json.loads(result.stdout)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            logging.exception("Could not read interface addresses")
+            return {"connected": False, "ip_address": None, "state": 0, "interface": None}
+
+        first_interface = None
+        for interface in interfaces:
+            name = interface["ifname"]
+            if not name.startswith(("eth", "en")) or interface.get("link_type") != "ether":
+                continue
+            first_interface = first_interface or name
+            if "LOWER_UP" not in interface.get("flags", []):
+                continue
+            for address in interface.get("addr_info", []):
+                if address.get("family") == "inet":
                     return {
                         "connected": True,
-                        "ip_address": ip_address,
+                        "ip_address": address["local"],
                         "state": 100,
-                        "interface": iface
+                        "interface": name,
                     }
-            
-            # Кабель есть, но IP нет
-            return {
-                "connected": False,
-                "ip_address": None,
-                "state": 30,  # DISCONNECTED
-                "interface": ethernet_interfaces[0] if ethernet_interfaces else None
-            }
-            
-        except Exception as e:
-            self.popup(f"Ошибка получения Ethernet статуса: {e}", 2)
-            return {"connected": False, "ip_address": None, "state": 0, "interface": None}
-        
+
+        return {
+            "connected": False,
+            "ip_address": None,
+            "state": 30 if first_interface else 0,
+            "interface": first_interface,
+        }
+
     def monitor_connection_status(self):
-        state = self.wlan_device.state
+        state = self.wlan_device.state if self.wlan_device else enums.DeviceState.UNAVAILABLE
         if self.wifi_state != state:
-            logging.debug(f"State changed: {state} {self.wlan_device.state_reason}")
+            logging.debug("Wi-Fi state changed to %s", state)
             if self.wifi_state == -1:
                 logging.debug("Starting to monitor state")
             elif state in [
