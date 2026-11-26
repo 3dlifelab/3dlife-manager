@@ -5,7 +5,7 @@ from flask import Flask, jsonify, request
 from sdbus import SdBusBaseError
 from sdbus_block.networkmanager import enums
 
-from sdbus_utils import SdbusNm
+from sdbus_utils import HotspotChannelError, SdbusNm, management_ap_configured
 
 app = Flask(__name__)
 CONNECTION_TIMEOUT = 8
@@ -90,17 +90,24 @@ def connect_network():
     nm = network_manager()
     if error := wifi_device_required(nm):
         return error
+    try:
+        target = nm.select_hotspot_compatible_target(ssid)
+    except HotspotChannelError as error:
+        return jsonify(error=str(error)), 409
     connection_path = nm.get_connection_path_by_ssid(ssid)
     new_profile = connection_path is None
     if new_profile:
-        result = nm.add_network(ssid, password, eap_method, identity, phase2)
+        result = nm.add_network(ssid, password, eap_method, identity, phase2, target=target)
         if "error" in result:
             return jsonify(result), 400
         connection_path = result["path"]
 
+    if target and not new_profile:
+        nm.pin_saved_profile(connection_path, target)
+
     connected = False
     try:
-        active_path = nm.connect(connection_path)
+        active_path = nm.connect(connection_path, target)
         deadline = time.monotonic() + CONNECTION_TIMEOUT
         while time.monotonic() < deadline:
             state = nm.wlan_device.state
@@ -134,7 +141,8 @@ def disconnect_network():
 
 @app.delete("/wifi/network/<path:ssid>")
 def delete_network(ssid):
-    network_manager().delete_network(ssid)
+    if not network_manager().delete_network(ssid):
+        return jsonify(error="Saved client Wi-Fi profile not found"), 404
     return jsonify(status="deleted", ssid=ssid)
 
 
@@ -143,6 +151,8 @@ def toggle_wifi():
     data = request.get_json(silent=True)
     if not isinstance(data, dict) or not isinstance(data.get("enable"), bool):
         return jsonify(error="Expected a boolean enable field"), 400
+    if not data["enable"] and management_ap_configured():
+        return jsonify(error="Disabling the Wi-Fi radio would stop the management access point"), 409
     nm = network_manager()
     if error := wifi_device_required(nm):
         return error

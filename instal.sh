@@ -64,7 +64,7 @@ for required_file in "$BACKEND_SOURCE_DIR/requirements.txt" "$SYSTEMD_SERVICE_FI
     "$YOUR_NGINX_CONFIG" "$FRONTEND_DIST_PATH/index.html"; do
     if [ ! -f "$required_file" ]; then
         log_error "Файл не найден: $required_file"
-        log_error "Сборка фронтенда: cd frontend && npm ci && npm run build"
+        log_error "Для установки используйте распакованный релиз с готовым фронтендом"
         exit 1
     fi
 done
@@ -92,8 +92,8 @@ apt install -y python3 python3-pip python3-venv python3-dev
 # Nginx
 apt install -y nginx
 
-# Polkit (обычно уже установлен, но на всякий случай)
-apt install -y policykit-1
+# Демон Polkit для авторизации запросов к NetworkManager
+apt install -y polkitd
 
 
 log_info "Системные пакеты установлены"

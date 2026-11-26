@@ -1,5 +1,8 @@
 import json
 import logging
+import re
+from dataclasses import dataclass
+from pathlib import Path
 import subprocess
 from uuid import uuid4
 
@@ -86,6 +89,49 @@ def WifiChannels(freq: str):
         return "?", "?"
 
 
+AP_INTERFACE = "uap0"
+AP_SETUP_UNIT = Path("/etc/systemd/system/3dlife-ap-interface.service")
+
+
+def station_settings(profile):
+    wireless = profile.get("802-11-wireless")
+    if wireless is None or "ssid" not in wireless:
+        return None
+    if wireless.get("mode", ("s", "infrastructure"))[1] != "infrastructure":
+        return None
+    interface = profile["connection"].get("interface-name")
+    if interface and interface[1] == AP_INTERFACE:
+        return None
+    return wireless
+
+
+def management_ap_configured():
+    return AP_SETUP_UNIT.is_file() or Path("/sys/class/net", AP_INTERFACE).exists()
+
+
+class HotspotChannelError(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class WifiTarget:
+    path: str
+    security: str
+    band: str
+    channel: int
+
+    @property
+    def channel_settings(self):
+        return {"band": ("s", self.band), "channel": ("u", self.channel)}
+
+
+def access_point_security(ap):
+    flags = ap.rsn_flags | ap.wpa_flags
+    if not flags and ap.flags & 1:
+        return "WEP"
+    return get_encryption(flags) or "Unknown"
+
+
 class SdbusNm:
     def popup_handler(self,msg, level=0):
         print(f"[POPUP-{level}] {msg}")
@@ -115,12 +161,17 @@ class SdbusNm:
         ]
 
     def get_wireless_interfaces(self):
-        devices = {path: NetworkDeviceGeneric(path) for path in self.nm.get_devices()}
-        return [
-            NetworkDeviceWireless(path)
-            for path, device in devices.items()
-            if device.device_type == enums.DeviceType.WIFI
-        ]
+        interfaces = []
+        for path in self.nm.get_devices():
+            device = NetworkDeviceGeneric(path)
+            if device.device_type != enums.DeviceType.WIFI:
+                continue
+            if device.interface == AP_INTERFACE or not device.managed:
+                continue
+            wireless = NetworkDeviceWireless(path)
+            if wireless.mode != enums.WiFiOperationMode.AP:
+                interfaces.append(wireless)
+        return sorted(interfaces, key=lambda device: device.interface != "wlan0")
 
     def get_primary_interface(self):
         if self.nm.primary_connection == "/":
@@ -140,10 +191,10 @@ class SdbusNm:
         for netpath in saved_network_paths:
             saved_con = NetworkConnectionSettings(netpath)
             con_settings = saved_con.get_settings()
-            if con_settings["connection"]["type"][1] == "802-11-wireless":
+            if wireless := station_settings(con_settings):
                 known_networks.append(
                     {
-                        "SSID": con_settings["802-11-wireless"]["ssid"][1].decode(errors="surrogateescape"),
+                        "SSID": wireless["ssid"][1].decode(errors="surrogateescape"),
                         "UUID": con_settings["connection"]["uuid"][1],
                     }
                 )
@@ -174,14 +225,10 @@ class SdbusNm:
             ssid = ap.ssid.decode("utf-8", errors="surrogateescape")
             if not ssid:
                 continue
-            flags = ap.rsn_flags | ap.wpa_flags
-            security = get_encryption(flags) or "Unknown"
-            if not flags and ap.flags & 1:
-                security = "WEP"
             networks.append({
                 "SSID": ssid,
                 "known": ssid in known_ssids,
-                "security": security,
+                "security": access_point_security(ap),
                 "frequency": WifiChannels(ap.frequency)[0],
                 "signal_level": ap.strength,
                 "BSSID": ap.hw_address,
@@ -215,8 +262,68 @@ class SdbusNm:
             None,
         )
 
-    def add_network(self, ssid, psk, eap_method, identity="", phase2=None):
-        security_type = self.get_security_type(ssid)
+    def select_hotspot_compatible_target(self, ssid):
+        if not management_ap_configured():
+            return None
+
+        hotspot = Path("/sys/class/net", AP_INTERFACE)
+        station = Path("/sys/class/net", self.wlan_device.interface)
+        try:
+            if (hotspot / "phy80211").resolve(strict=True) != (station / "phy80211").resolve(strict=True):
+                return None
+            hotspot_address = (hotspot / "address").read_text().strip().lower()
+            result = subprocess.run(
+                ["/usr/sbin/iw", "dev", AP_INTERFACE, "info"],
+                capture_output=True, text=True, timeout=2, check=True,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise HotspotChannelError("Не удалось определить канал точки управления") from error
+
+        match = re.search(r"^\s*channel\s+(\d+)\s+\((\d+) MHz\)", result.stdout, re.MULTILINE)
+        if not match:
+            raise HotspotChannelError("Не удалось определить канал точки управления")
+        channel, frequency = map(int, match.groups())
+        band = {"2.4": "bg", "5": "a", "6": "6GHz"}.get(WifiChannels(frequency)[0])
+        if band is None:
+            raise HotspotChannelError(f"Точка управления работает на неподдерживаемой частоте {frequency} МГц")
+
+        selected_path = None
+        selected_ap = None
+        for path in self.wlan_device.access_points:
+            ap = AccessPoint(path)
+            if ap.ssid.decode("utf-8", errors="surrogateescape") != ssid or ap.frequency != frequency:
+                continue
+            if ap.hw_address.lower() == hotspot_address:
+                continue
+            if selected_ap is None or ap.strength > selected_ap.strength:
+                selected_path, selected_ap = path, ap
+
+        if selected_ap is None:
+            raise HotspotChannelError(
+                f"Сеть недоступна на канале {channel} ({frequency} МГц), "
+                "который использует точка управления"
+            )
+
+        return WifiTarget(selected_path, access_point_security(selected_ap), band, channel)
+
+    @staticmethod
+    def pin_saved_profile(connection_path, target):
+        profile = NetworkConnectionSettings(connection_path)
+        settings = profile.get_settings()
+        wireless = settings["802-11-wireless"]
+        if all(wireless.get(key) == value for key, value in target.channel_settings.items()):
+            return
+
+        # GetSettings never returns secrets. Keep credentials when saving the channel lock.
+        for section in ("802-11-wireless-security", "802-1x"):
+            if section in settings:
+                secrets = profile.get_secrets(section)
+                settings[section].update(secrets.get(section, {}))
+        wireless.update(target.channel_settings)
+        profile.update(settings)
+
+    def add_network(self, ssid, psk, eap_method, identity="", phase2=None, *, target=None):
+        security_type = target.security if target else self.get_security_type(ssid)
         logging.debug(f"Adding network of type: {security_type}")
         if security_type is None:
             return {"error": "network_not_found", "message": "Network not found"}
@@ -235,6 +342,9 @@ class SdbusNm:
             "ipv4": {"method": ("s", "auto")},
             "ipv6": {"method": ("s", "auto")},
         }
+
+        if target:
+            properties["802-11-wireless"].update(target.channel_settings)
 
         if security_type not in ("Open", "OWE", "OWE-TM") and not psk:
             return {"error": "Password required for new network"}
@@ -306,8 +416,18 @@ class SdbusNm:
         self.wlan_device.disconnect()
 
     def delete_network(self, ssid):
-        if path := self.get_connection_path_by_ssid(ssid):
-            self.delete_connection_path(path)
+        preferred_path = None
+        if self.wlan_device:
+            active_path = self.wlan_device.active_connection
+            if active_path != "/":
+                preferred_path = ActiveConnection(active_path).connection
+
+        path = self.get_connection_path_by_ssid(ssid, preferred_path)
+        if path is None:
+            return False
+
+        self.delete_connection_path(path)
+        return True
 
     def delete_connection_path(self, path):
         NetworkConnectionSettings(path).delete()
@@ -315,23 +435,20 @@ class SdbusNm:
     def rescan(self):
         self.wlan_device.request_scan({})
 
-    def get_connection_path_by_ssid(self, ssid):
-        existing_networks = NetworkManagerSettings().list_connections()
-        for connection_path in existing_networks:
-            connection_settings = NetworkConnectionSettings(
-                connection_path
-            ).get_settings()
-            if (
-                connection_settings.get("802-11-wireless")
-                and connection_settings["802-11-wireless"].get("ssid")
-                and connection_settings["802-11-wireless"]["ssid"][1].decode(errors="surrogateescape") == ssid
-            ):
-                return connection_path
-        return None
+    def get_connection_path_by_ssid(self, ssid, preferred_path=None):
+        first_match = None
+        for path in NetworkManagerSettings().list_connections():
+            wireless = station_settings(NetworkConnectionSettings(path).get_settings())
+            if wireless is None or wireless["ssid"][1].decode(errors="surrogateescape") != ssid:
+                continue
+            if preferred_path is None or path == preferred_path:
+                return path
+            first_match = first_match or path
+        return first_match
 
-    def connect(self, connection_path):
+    def connect(self, connection_path, target=None):
         device_path = self.nm.get_device_by_ip_iface(self.wlan_device.interface)
-        return self.nm.activate_connection(connection_path, device_path)
+        return self.nm.activate_connection(connection_path, device_path, target.path if target else "/")
 
     def toggle_wifi(self, enable):
         self.nm.wireless_enabled = enable
